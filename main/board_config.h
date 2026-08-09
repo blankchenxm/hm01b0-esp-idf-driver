@@ -19,7 +19,8 @@
 /* 8-bit parallel camera interface reserved for the capture milestone. */
 #define BOARD_HM01B0_PCLK_GPIO     GPIO_NUM_6
 #define BOARD_HM01B0_VSYNC_GPIO    GPIO_NUM_7
-#define BOARD_HM01B0_HSYNC_GPIO    GPIO_NUM_8
+#define BOARD_HM01B0_DE_GPIO       GPIO_NUM_8
+#define BOARD_HM01B0_HSYNC_GPIO    BOARD_HM01B0_DE_GPIO
 #define BOARD_HM01B0_D0_GPIO       GPIO_NUM_9
 #define BOARD_HM01B0_D1_GPIO       GPIO_NUM_10
 #define BOARD_HM01B0_D2_GPIO       GPIO_NUM_11
