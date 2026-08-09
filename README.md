@@ -6,8 +6,9 @@ sensor on ESP32-S3.
 The repository currently contains the completed sensor-control foundation:
 external MCLK generation, 16-bit-address/8-bit-data I2C access, model-ID probe,
 register tables, operating modes, interface configuration, test patterns, and a
-standby/streaming state machine. Parallel DVP capture is the next development
-stage.
+standby/streaming state machine. The Stage 3 branch adds direct ESP32-S3 DVP
+capture with two internal DMA frame buffers; physical-board validation is still
+required before the stage is complete.
 
 ## Current status
 
@@ -15,11 +16,12 @@ stage.
 |---|---|---|
 | 1. MCLK + I2C | Complete | 12 MHz MCLK, I2C register access, `MODEL_ID=0x01B0` probe |
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
-| 3. DVP capture | Planned | ESP32-S3 LCD_CAM/GDMA, DMA frame buffers, frame callbacks, RAW8 validation |
+| 3. DVP capture | Implemented, validation pending | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, CRC/Walking-1 validation |
 | 4. Display/application pipeline | Planned | Frame processing and optional LCD output |
 
-The current sample application initializes the sensor and intentionally leaves
-it in standby. It does not capture image data yet.
+The current sample application initializes the sensor in standby, prepares the
+receiver and buffers, starts Camera RX, and only then starts HM01B0 streaming.
+It validates raw frames over serial logs and does not drive the ST7789.
 
 ## Initial sensor configuration
 
@@ -37,6 +39,28 @@ it in standby. It does not capture image data yet.
 | Frame timing | 376 PCK x 532 lines, approximately 30 FPS |
 | I2C address | `0x24` (7-bit) |
 | Expected model ID | `0x01B0` |
+
+## Stage 3 first capture configuration
+
+The first capture version deliberately receives the complete HM01B0 QVGA
+transport frame and performs no crop:
+
+| Setting | Value |
+|---|---|
+| DVP transport | 324 x 244 RAW8 |
+| Payload | 79,056 bytes |
+| Sensor-valid crop metadata | x=2, y=0, 320 x 244 (not applied) |
+| Optional standard-QVGA crop | x=2, y=2, 320 x 240 (not applied) |
+| Buffers | Two application-visible buffers |
+| Memory | Internal DMA-capable SRAM |
+| Buffer allocation | Driver-aligned length from `esp_cam_ctlr_get_frame_buffer_len()` |
+| Backup buffer | Disabled |
+| DMA burst | 64 bytes |
+| Validation | Received length, CRC32, Walking-1 structure, FPS, queue errors, maximum processing time |
+
+The frame descriptor keeps the 79,056-byte payload size, aligned buffer
+capacity, and per-transaction received size separate. Full geometry decisions
+and the hardware checklist are recorded in [stage3_todo.md](stage3_todo.md).
 
 ## Wiring used by the sample application
 
@@ -65,9 +89,14 @@ components/hm01b0/
   hm01b0_modes.c           Common, mode, interface, and test-pattern tables
   hm01b0_sensor.c          Probe and sensor state-machine operations
 
+components/hm01b0_capture/
+  include/                 Capture lifecycle and statistics API
+  hm01b0_capture.c         DVP controller, DMA buffers, queues, callbacks,
+                           validation task, and rate-limited diagnostics
+
 main/
   board_config.h           Sample board pin mapping
-  main.c                   Stage 1+2 probe/initialization application
+  main.c                   Stage 3 receiver-first streaming application
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
@@ -131,6 +160,11 @@ Expected successful initialization includes an ID report equivalent to:
 MODEL_ID_H=0x01, MODEL_ID_L=0xB0, MODEL_ID=0x01B0
 PASS: HM01B0 initialized in STANDBY
 ```
+
+Stage 3 then reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
+addresses, internal DMA heap usage, a small first-frame sample, and one summary
+per second. It never prints a complete frame. Hardware acceptance requires at
+least 60 seconds near 30 FPS with no size, pattern, starvation, or queue errors.
 
 Board-specific `sdkconfig` files and local editor/tool paths are intentionally
 not committed.
