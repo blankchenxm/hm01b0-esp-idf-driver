@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "hm01b0.c"
+        "hm01b0_modes.c"
+        "hm01b0_reg.c"
+        "hm01b0_sensor.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "private_include"
+    REQUIRES
+        esp_driver_gpio
+        esp_driver_i2c
+        esp_driver_ledc
+        esp_rom
+        freertos
+)
