@@ -20,4 +20,12 @@ idf_component_register(
 # so esp_cache_msync() correctly reports ESP_ERR_NOT_SUPPORTED even though no
 # synchronization is required.  Keep the workaround local to this component
 # and leave the installed ESP-IDF tree untouched.
-target_link_libraries(${COMPONENT_LIB} INTERFACE "-Wl,--wrap=esp_cache_msync")
+target_link_libraries(
+    ${COMPONENT_LIB}
+    INTERFACE
+        "-Wl,--wrap=esp_cache_msync"
+        # The wrapper lives in a separate object inside this component's
+        # static archive. Force that object to be extracted before references
+        # from esp_driver_cam are resolved.
+        "-Wl,--undefined=__wrap_esp_cache_msync"
+)
