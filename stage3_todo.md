@@ -63,8 +63,8 @@ and monitored.
 
 ## Hardware acceptance
 
-- [ ] Build for ESP32-S3 with ESP-IDF 6.0.
-- [ ] Flash and monitor the physical board.
+- [x] Build for ESP32-S3 with ESP-IDF 6.0.
+- [x] Flash and monitor the physical board.
 - [ ] Capture continuously for at least 60 seconds at approximately 30 FPS.
 - [ ] Observe zero size errors, Walking-1 errors, buffer starvation and ready
   queue overflow.
@@ -79,3 +79,16 @@ and monitored.
 - PSRAM, a third application buffer, and the driver backup buffer.
 - Continuous full-frame serial output.
 - Runtime Full/QVGA/QQVGA capture switching.
+
+## First hardware run - 2026-08-09
+
+- [x] HM01B0 model ID read correctly as `0x01B0`.
+- [x] Software reset and QVGA/8-bit/Walking-1 setup completed in standby.
+- [x] DVP controller accepted RAW8 324x244 with a 79056-byte frame length.
+- [x] Both 79056-byte buffers were allocated from internal DMA-capable SRAM.
+- [ ] Camera RX did not start because ESP-IDF 6.0 called
+  `esp_cache_msync(M2C)` on non-cached internal SRAM and propagated the
+  expected `ESP_ERR_NOT_SUPPORTED` result as a transaction failure.
+- [x] Added a project-local linker wrapper which treats only the internal-RAM
+  M2C `ESP_ERR_NOT_SUPPORTED` case as a successful no-op. The ESP-IDF
+  installation remains unchanged; hardware re-test is pending.

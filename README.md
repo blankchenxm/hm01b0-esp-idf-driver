@@ -62,6 +62,18 @@ The frame descriptor keeps the 79,056-byte payload size, aligned buffer
 capacity, and per-transaction received size separate. Full geometry decisions
 and the hardware checklist are recorded in [stage3_todo.md](stage3_todo.md).
 
+### ESP-IDF 6.0 internal-SRAM compatibility
+
+ESP-IDF 6.0's DVP controller unconditionally calls
+`esp_cache_msync(..., ESP_CACHE_MSYNC_FLAG_DIR_M2C)` before starting a frame.
+On ESP32-S3, internal SRAM is not data-cached, so the cache API returns
+`ESP_ERR_NOT_SUPPORTED` even though the buffer is valid for GDMA and no cache
+operation is needed. `hm01b0_cache_compat.c` provides a project-local linker
+wrapper that converts only this internal-memory/no-cache result to `ESP_OK`.
+PSRAM cache operations, cacheable-memory alignment failures, invalid
+arguments, and every other result still use the original ESP-IDF
+implementation. The installed ESP-IDF tree is not modified.
+
 ## Wiring used by the sample application
 
 | HM01B0 signal | ESP32-S3 GPIO |
@@ -93,6 +105,7 @@ components/hm01b0_capture/
   include/                 Capture lifecycle and statistics API
   hm01b0_capture.c         DVP controller, DMA buffers, queues, callbacks,
                            validation task, and rate-limited diagnostics
+  hm01b0_cache_compat.c    ESP-IDF 6.0 internal-SRAM DVP cache workaround
 
 main/
   board_config.h           Sample board pin mapping
