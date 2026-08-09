@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "hm01b0_capture.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        esp_driver_cam
+        esp_driver_gpio
+        esp_hw_support
+        esp_rom
+        esp_timer
+        freertos
+        heap
+        log
+)
