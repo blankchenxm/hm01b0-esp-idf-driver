@@ -61,6 +61,8 @@ transport frame and performs no crop:
 The frame descriptor keeps the 79,056-byte payload size, aligned buffer
 capacity, and per-transaction received size separate. Full geometry decisions
 and the hardware checklist are recorded in [stage3_todo.md](stage3_todo.md).
+The detailed Stage 3 flow and the combined Stages 1-3 call sequence are
+recorded in [docs/execution-flow.md](docs/execution-flow.md).
 
 ### ESP-IDF 6.0 internal-SRAM compatibility
 
@@ -113,6 +115,9 @@ main/
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
+
+docs/
+  execution-flow.md        Detailed Stage 3 and combined Stages 1-3 call flow
 ```
 
 The ST7789 source files under `main/` are not part of the current build and are
