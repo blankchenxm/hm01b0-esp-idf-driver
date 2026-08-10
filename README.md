@@ -16,8 +16,8 @@ snapshot on an SPI ST7789 while Camera RX continues running.
 |---|---|---|
 | 1. MCLK + I2C | Complete | 12 MHz MCLK, I2C register access, `MODEL_ID=0x01B0` probe |
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
-| 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and Walking-1 observation |
-| 4. Static ST7789 display | Implemented, validation pending | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
+| 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and selectable test-pattern observation |
+| 4. Static ST7789 display | Implemented, Color-Bar validation pending | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 
 The current sample application initializes the sensor and ST7789, prepares the
 receiver and buffers, starts Camera RX, and only then starts HM01B0 streaming.
@@ -31,7 +31,7 @@ application snapshot, and displays that snapshot once without stopping capture.
 | Sensor mode | QVGA |
 | Pixel output | RAW8 |
 | Data interface | 8-bit parallel |
-| Test pattern | Walking 1 |
+| Test pattern | Color Bar (current sample; Walking-1 also supported) |
 | Operation | Non-SYNC |
 | PCLK | Non-gated, rising edge |
 | MCLK | 12 MHz external clock |
@@ -57,7 +57,7 @@ transport frame and performs no crop:
 | Buffer allocation | Driver-aligned length from `esp_cam_ctlr_get_frame_buffer_len()` |
 | Backup buffer | Disabled |
 | DMA burst | 64 bytes |
-| Analysis | Exact received length, raw/active CRC32, four-row Walking-1 sampling, FPS, queue errors, maximum processing time |
+| Analysis | Exact received length, raw/active CRC32, selectable four-row Walking-1 or Color-Bar observation, FPS, queue errors, maximum processing time |
 | Warm-up | Skip five startup frames before content baselines |
 
 The frame descriptor keeps the 79,056-byte payload size, aligned buffer
@@ -79,6 +79,15 @@ RAW8 snapshot to RGB565 in small chunks and writes the screen once. Camera RX
 and Stage 3 diagnostics continue afterward; ST7789 GRAM retains the static
 image. The detailed scope, ownership flow, expected logs, and hardware checks
 are recorded in [stage4_todo.md](stage4_todo.md).
+
+The capture component exposes mutually exclusive `NONE`, `WALKING_1`, and
+`COLOR_BAR` analysis modes. Color-Bar observation compares four representative
+rows, counts horizontal and strong transitions, records the six nominal bar
+center samples, and reports their vertical consistency without assuming exact
+RAW8 values not specified by the datasheet. On the monochrome HM01B0-MWA, the
+LCD shows these bars as grayscale regions rather than RGB colors. Analysis uses
+the full 320-pixel active row, while the unchanged 240-pixel center crop trims
+40 columns from each side, so the two outer bars appear narrower on the LCD.
 
 ### ESP-IDF 6.0 internal-SRAM compatibility
 
@@ -203,7 +212,8 @@ PASS: HM01B0 initialized in STANDBY
 
 Stage 3 reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
 addresses, internal DMA heap usage, raw/active CRCs, compact samples from four
-active rows, and one summary per second. It never prints a complete frame.
+active rows, selected test-pattern structure, and one summary per second. It
+never prints a complete frame.
 Stage 4 additionally reports the snapshot crop, copy/hold timing, source frame,
 and one-time LCD transfer duration. Hardware acceptance requires continued
 capture near 30 FPS with no size, starvation, or queue errors and a stable
