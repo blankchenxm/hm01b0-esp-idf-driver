@@ -190,22 +190,26 @@ esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
     const hm01b0_regval_t *table = NULL;
     size_t count = 0;
     const char *name = NULL;
+    uint8_t expected_register = 0U;
 
     switch (pattern) {
     case HM01B0_TEST_PATTERN_OFF:
         table = hm01b0_test_pattern_off;
         count = hm01b0_test_pattern_off_count;
         name = "OFF";
+        expected_register = HM01B0_TEST_PATTERN_REG_DISABLED;
         break;
     case HM01B0_TEST_PATTERN_COLOR_BAR:
         table = hm01b0_test_pattern_color_bar;
         count = hm01b0_test_pattern_color_bar_count;
         name = "COLOR_BAR";
+        expected_register = HM01B0_TEST_PATTERN_REG_COLOR_BAR;
         break;
     case HM01B0_TEST_PATTERN_WALKING_1:
         table = hm01b0_test_pattern_walking_1;
         count = hm01b0_test_pattern_walking_1_count;
         name = "WALKING_1";
+        expected_register = HM01B0_TEST_PATTERN_REG_WALKING_1;
         break;
     default:
         return ESP_ERR_INVALID_ARG;
@@ -213,8 +217,22 @@ esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
 
     ESP_RETURN_ON_ERROR(hm01b0_write_table(dev, table, count), TAG,
                         "failed to apply %s test-pattern table", name);
+
+    uint8_t register_value = 0U;
+    ESP_RETURN_ON_ERROR(hm01b0_reg_read(dev, HM01B0_REG_TEST_PATTERN_MODE,
+                                        &register_value),
+                        TAG, "failed to read back %s test-pattern mode", name);
+    const uint8_t mode_mask = HM01B0_TEST_PATTERN_ENABLE_MASK |
+                              HM01B0_TEST_PATTERN_SELECT_MASK;
+    ESP_RETURN_ON_FALSE((register_value & mode_mask) == expected_register,
+                        ESP_ERR_INVALID_RESPONSE, TAG,
+                        "%s test-pattern readback mismatch: expected=0x%02X "
+                        "actual=0x%02X",
+                        name, expected_register, register_value);
+
     dev->test_pattern = pattern;
-    ESP_LOGI(TAG, "test_pattern=%s", name);
+    ESP_LOGI(TAG, "test_pattern=%s, register 0x0601=0x%02X", name,
+             register_value);
     return ESP_OK;
 }
 

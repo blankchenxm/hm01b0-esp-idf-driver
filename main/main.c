@@ -12,10 +12,15 @@
 
 #define HM01B0_QVGA_RAW_WIDTH        324U
 #define HM01B0_QVGA_RAW_HEIGHT       244U
+#define HM01B0_QVGA_ACTIVE_X           2U
+#define HM01B0_QVGA_ACTIVE_Y           0U
+#define HM01B0_QVGA_ACTIVE_WIDTH     320U
+#define HM01B0_QVGA_ACTIVE_HEIGHT    244U
 #define HM01B0_CAPTURE_DMA_BURST       64U
 #define HM01B0_CAPTURE_TASK_STACK     4096U
 #define HM01B0_CAPTURE_TASK_PRIORITY     5U
 #define HM01B0_CAPTURE_STATS_PERIOD_MS 1000U
+#define HM01B0_CAPTURE_WARMUP_FRAMES      5U
 
 static const char *TAG = "hm01b0_probe";
 static hm01b0_handle_t *s_sensor;
@@ -86,11 +91,16 @@ void app_main(void)
         .de_gpio = BOARD_HM01B0_DE_GPIO,
         .raw_width = HM01B0_QVGA_RAW_WIDTH,
         .raw_height = HM01B0_QVGA_RAW_HEIGHT,
+        .active_x = HM01B0_QVGA_ACTIVE_X,
+        .active_y = HM01B0_QVGA_ACTIVE_Y,
+        .active_width = HM01B0_QVGA_ACTIVE_WIDTH,
+        .active_height = HM01B0_QVGA_ACTIVE_HEIGHT,
         .dma_burst_size = HM01B0_CAPTURE_DMA_BURST,
         .task_stack_size = HM01B0_CAPTURE_TASK_STACK,
         .task_priority = HM01B0_CAPTURE_TASK_PRIORITY,
         .stats_period_ms = HM01B0_CAPTURE_STATS_PERIOD_MS,
-        .validate_walking_1 = true,
+        .warmup_frames = HM01B0_CAPTURE_WARMUP_FRAMES,
+        .analyze_walking_1 = true,
     };
 
     ret = hm01b0_capture_new(&capture_config, &s_capture);
@@ -129,7 +139,7 @@ void app_main(void)
              "Stage 3 running: HM01B0 QVGA RAW8 324x244 Walking-1; "
              "ST7789 output and cropping are disabled");
 
-    /* Keep the application owner task alive while the capture task validates. */
+    /* Keep the application owner task alive while the capture task analyzes. */
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(1000U));
     }

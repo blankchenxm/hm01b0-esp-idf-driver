@@ -38,7 +38,7 @@ dma_burst_size  = 64
 task_stack_size = 4096 bytes
 task_priority   = 5
 stats_period_ms = 1000 ms
-Walking-1 验证 = 开启
+Walking-1 观察分析 = 开启
 ```
 
 这里只是在 `app_main()` 栈上准备配置值，还没有创建 Camera Controller，也
@@ -136,7 +136,7 @@ hm01b0_capture_new(&capture_config, &s_capture);
     - Capture Handle 作为两个回调的 `user_data`。
 23. 调用 `xTaskCreate()` 创建 `hm01b0_capture_task()`。
 24. 帧处理任务初始化统计时间，然后阻塞等待 `ready_queue`；因为还没有
-    完成帧，所以暂时不做 CRC 或 Walking-1 验证。
+    完成帧，所以暂时不做 CRC 或 Walking-1 分析。
 25. 调用 `hm01b0_capture_log_memory()`，打印：
     - 分配 A/B 前后的 DMA-capable 内存；
     - 最大连续块；
@@ -313,38 +313,40 @@ Frame A 被放入 `ready_queue` 后：
 
 1. `xQueueReceive(ready_queue, &frame, 100 ms)` 返回 Frame A。
 2. 设置 `processing_frame = true`。
-3. 仅第一帧将前 32 bytes 复制到任务栈上的小数组，使 Buffer 可以先归还，
-   再打印串口样本。
+3. 前 5 帧作为 warm-up，只检查传输长度，不建立内容基准。
 4. 调用 `hm01b0_capture_process_frame(handle, frame)`。
 5. `hm01b0_capture_process_frame()` 用 `esp_timer_get_time()` 记录开始时间。
-6. 检查 `received_size` 位于 `payload_size` 和 `buffer_capacity` 之间。
+6. 检查 `received_size` 是否严格等于 `payload_size`（79056 bytes）。
 7. 第一帧通过后，将长度保存为 `baseline_received_size`。
-8. 后续帧必须与长度基准相同；变化会同时增加 `size_errors` 和
-   `received_size_changes`。
-9. 调用 `esp_crc32_le()`，只对 79056-byte payload 计算 CRC32。
-10. 第一帧 CRC 保存为 `baseline_crc`；后续变化增加 `crc_changes`。
-11. 开启 Walking-1 验证时，调用
-    `hm01b0_validate_walking_one()`：
-    - `hm01b0_is_one_hot()` 检查像素是否只有一个 bit 为 1；
-    - `hm01b0_rotate_left_one()` 和
-      `hm01b0_rotate_right_one()` 根据前两个像素判断循环方向；
-    - 检查每一行中所有 324 个字节；
-    - 检查全部 244 行具有相同的相位和方向；
-    - 第一个错误会返回 x/y、期望值和实际值。
-12. 需要输出详细错误时调用
+8. 后续帧长度变化增加 `received_size_changes`，非 79056-byte 帧增加
+   `size_errors`；长度正确即增加 `transport_valid_frames`。
+9. warm-up 结束后，调用 `esp_crc32_le()` 计算完整 324x244 raw CRC，
+   再逐行累计 x=2、width=320 的 320x244 active CRC。
+10. 第一张 warm-up 后的帧建立 raw/active CRC 基准；active CRC 还会与
+    前一帧比较，区分“始终不同于基准”和“相邻帧发生变化”。
+11. 开启 Walking-1 观察时，调用 `hm01b0_analyze_walking_one()`：
+    - 只分析 x=2、y=0、320x244，不复制或裁剪 DMA Buffer；
+    - 比较后 243 行与第一行，统计相同行数和垂直 mismatch；
+    - 统计第一行水平方向的数值跳变次数；
+    - 统计 unique、zero、one-hot 和 other 数值数量；
+    - 不再假定 datasheet 未定义的逐像素 one-hot 循环序列。
+12. 需要输出长度错误时调用
     `hm01b0_capture_error_log_allowed()`，把错误日志限制为每秒最多一次。
-13. 长度、CRC和 Walking-1 都通过才增加 `frames_valid`。
+13. CRC和 Walking-1 仅作为内容诊断，不会把长度正确的 DMA 帧判为无效。
 14. 记录 `last_processing_time_us`，必要时更新
     `max_processing_time_us`。
 15. 从 `hm01b0_capture_process_frame()` 返回。
-16. 调用 `xQueueSend(free_queue, &frame, 0)`，将 A 归还空闲池。
-17. 设置 `processing_frame = false`。
-18. 仅第一帧输出序号、长度、CRC和预先复制的 32-byte 样本，不输出完整帧。
+16. 第一张分析帧先复制 raw 第一行和 active 顶部/中部/底部各
+    32 bytes 到任务栈上的小快照。
+17. 调用 `xQueueSend(free_queue, &frame, 0)`，将 A 归还空闲池。
+18. 设置 `processing_frame = false`，再从小快照打印四组样本；只打印
+    一次，不占用 DMA Buffer 输出串口，也不输出完整帧。
 19. 达到统计周期时调用 `hm01b0_capture_log_stats()`：
     - 快照 ISR 计数；
     - 根据帧数增量和微秒时间计算 `fps_milli`；
-    - 打印 received/valid/各种错误；
-    - 打印 CRC、处理时间和队列深度。
+    - 打印 transport、warm-up、长度和队列状态；
+    - 打印 raw/active CRC 变化和 Walking-1 结构统计；
+    - 打印处理时间和队列深度。
 20. 任务重新阻塞等待 `ready_queue`。
 
 归还 A 后，B 仍由 DMA 写入：
@@ -581,7 +583,9 @@ Motion Detection 及默认图像方向等公共参数。
 1. `hm01b0_require_standby()` 检查状态。
 2. `switch` 选择 `hm01b0_test_pattern_walking_1`。
 3. `hm01b0_write_table()` 对 TEST_PATTERN_MODE 做 masked update。
-4. 设置 `dev->test_pattern = HM01B0_TEST_PATTERN_WALKING_1`。
+4. `hm01b0_reg_read(0x0601)` 读回 TEST_PATTERN_MODE。
+5. 对 enable/select mask 检查读回值为 `0x11`，否则初始化失败。
+6. 设置 `dev->test_pattern = HM01B0_TEST_PATTERN_WALKING_1` 并打印读回值。
 
 OFF 和 COLOR_BAR 表及其选择分支存在，但当前启动不调用。
 
@@ -672,17 +676,17 @@ ISR 不计算整帧 CRC、不遍历 Walking-1、不刷新显示、不阻塞等�
 ```text
 hm01b0_capture_task()
   -> xQueueReceive(ready_queue, timeout=100 ms)
-  -> 第一帧可复制前 32 bytes
   -> hm01b0_capture_process_frame()
-       -> 长度/长度基准检查
-       -> esp_crc32_le()
-       -> hm01b0_validate_walking_one()
+       -> 严格长度/长度基准检查
+       -> 前 5 帧 warm-up
+       -> esp_crc32_le(raw 324x244)
+       -> hm01b0_capture_active_crc(active 320x244)
+       -> hm01b0_analyze_walking_one()
             -> hm01b0_is_one_hot()
-            -> hm01b0_rotate_left_one()/right_one()
-       -> 出错时 hm01b0_capture_error_log_allowed()
-       -> 更新有效帧/错误/处理时间统计
+       -> 长度出错时 hm01b0_capture_error_log_allowed()
+       -> 更新传输/CRC/Walking-1/处理时间统计
+  -> warm-up 后第一张分析帧调用 hm01b0_capture_log_first_analysis()
   -> xQueueSend(free_queue) 归还 Buffer
-  -> 第一帧仅输出一次小样本
   -> 到周期时 hm01b0_capture_log_stats()
   -> 重复
 ```
@@ -782,10 +786,11 @@ hm01b0_stop(sensor)
 | `hm01b0_capture_find_frame()` | Finished 回调内部 |
 | `hm01b0_capture_task()` | 持续运行的 FreeRTOS Task |
 | `hm01b0_capture_process_frame()` | 每个从 ready_queue 取出的帧 |
-| `hm01b0_validate_walking_one()` | 每帧且验证开启时 |
-| `hm01b0_is_one_hot()` | Walking-1 内层检查 |
-| `hm01b0_rotate_left_one()` | Walking-1 左循环计算 |
-| `hm01b0_rotate_right_one()` | Walking-1 右循环计算 |
+| `hm01b0_capture_active_crc()` | warm-up 后逐行计算 320x244 active CRC |
+| `hm01b0_analyze_walking_one()` | warm-up 后观察有效区行结构和值分布 |
+| `hm01b0_is_one_hot()` | Walking-1 值分类，不再作为整帧硬性判错条件 |
+| `hm01b0_capture_take_analysis_sample()` | 归还 DMA Buffer 前复制四组 32-byte 小样本 |
+| `hm01b0_capture_log_first_analysis()` | 仅第一张分析帧输出四组小样本 |
 | `hm01b0_capture_error_log_allowed()` | 有详细错误需要打印时 |
 | `hm01b0_capture_log_stats()` | 每个统计周期，包括无帧情况 |
 | `hm01b0_capture_stop()` | 启动错误或未来正常关闭 |

@@ -14,8 +14,8 @@ and monitored.
 - [x] Current QQVGA transport: 162x122 RAW8.
   - Sensor-valid crop: x=1, y=0, 160x122.
   - Optional standard-QQVGA crop: x=1, y=1, 160x120.
-- [x] Stage 3 captures and validates the complete 324x244 QVGA transport
-  frame. It does not crop.
+- [x] Stage 3 DMA captures the complete 324x244 QVGA transport frame. Walking-1
+  analysis uses x=2, y=0, 320x244 without copying or modifying the frame.
 
 ## Controller and memory
 
@@ -43,13 +43,23 @@ and monitored.
 
 ## Validation task and logging
 
-- [x] Run CRC32 over the 79056-byte QVGA payload only.
-- [x] Validate Walking-1 structurally without assuming an undocumented phase:
-  one-hot bytes, cyclic adjacent columns, and identical rows.
-- [x] Track frame sequence, stable received size, CRC changes, measured FPS,
-  queue errors, and last/maximum processing time.
+- [x] Read back register 0x0601 after selecting a test pattern and verify the
+  enable/select bits.
+- [x] Skip five startup frames before establishing content baselines.
+- [x] Calculate separate CRC32 values for the complete 324x244 transport and
+  the x=2, y=0, 320x244 sensor-valid analysis area.
+- [x] Compare CRCs against the first post-warm-up frame and compare active CRC
+  against the immediately previous frame.
+- [x] Observe Walking-1 without assuming an undocumented byte sequence:
+  equal rows, vertical mismatches, first-row horizontal transitions, unique
+  values, and zero/one-hot/other value counts.
+- [x] Treat exact received length as transport validity. CRC and Walking-1
+  observations no longer invalidate an otherwise complete DMA frame.
+- [x] Track frame sequence, stable received size, measured FPS, queue errors,
+  and last/maximum processing time.
 - [x] Print configuration and memory information once at startup.
-- [x] Print a small first-frame sample once; never print a complete frame.
+- [x] After warm-up, print small samples from the raw first row and three active
+  rows once; never print a complete frame.
 - [x] Print a rate-limited statistics summary once per second.
 - [x] Rate-limit error details and include the first mismatch coordinate.
 
@@ -66,8 +76,9 @@ and monitored.
 - [x] Build for ESP32-S3 with ESP-IDF 6.0.
 - [x] Flash and monitor the physical board.
 - [ ] Capture continuously for at least 60 seconds at approximately 30 FPS.
-- [ ] Observe zero size errors, Walking-1 errors, buffer starvation and ready
-  queue overflow.
+- [ ] Observe zero size errors, buffer starvation and ready queue overflow.
+- [ ] Record raw/active CRC behavior and the Walking-1 structure statistics;
+  define an exact pass rule only after the real sensor output is understood.
 - [ ] Confirm maximum processing time remains below the 33.3 ms frame period
   with useful margin.
 - [ ] Confirm stop and restart do not trigger DMA errors or assertions.

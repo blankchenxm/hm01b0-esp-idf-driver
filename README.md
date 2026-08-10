@@ -16,7 +16,7 @@ required before the stage is complete.
 |---|---|---|
 | 1. MCLK + I2C | Complete | 12 MHz MCLK, I2C register access, `MODEL_ID=0x01B0` probe |
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
-| 3. DVP capture | Implemented, validation pending | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, CRC/Walking-1 validation |
+| 3. DVP capture | Implemented, validation pending | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and Walking-1 observation |
 | 4. Display/application pipeline | Planned | Frame processing and optional LCD output |
 
 The current sample application initializes the sensor in standby, prepares the
@@ -56,7 +56,8 @@ transport frame and performs no crop:
 | Buffer allocation | Driver-aligned length from `esp_cam_ctlr_get_frame_buffer_len()` |
 | Backup buffer | Disabled |
 | DMA burst | 64 bytes |
-| Validation | Received length, CRC32, Walking-1 structure, FPS, queue errors, maximum processing time |
+| Analysis | Exact received length, raw/active CRC32, Walking-1 row/value statistics, FPS, queue errors, maximum processing time |
+| Warm-up | Skip five startup frames before content baselines |
 
 The frame descriptor keeps the 79,056-byte payload size, aligned buffer
 capacity, and per-transaction received size separate. Full geometry decisions
@@ -180,9 +181,11 @@ PASS: HM01B0 initialized in STANDBY
 ```
 
 Stage 3 then reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
-addresses, internal DMA heap usage, a small first-frame sample, and one summary
-per second. It never prints a complete frame. Hardware acceptance requires at
-least 60 seconds near 30 FPS with no size, pattern, starvation, or queue errors.
+addresses, internal DMA heap usage, raw/active CRCs, compact samples from three
+active rows, and one summary per second. It never prints a complete frame.
+Hardware acceptance requires at least 60 seconds near 30 FPS with no size,
+starvation, or queue errors; Walking-1 is observed structurally until its exact
+byte sequence is established from hardware data.
 
 Board-specific `sdkconfig` files and local editor/tool paths are intentionally
 not committed.
