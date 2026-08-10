@@ -799,5 +799,6 @@ hm01b0_stop(sensor)
 | `hm01b0_capture_delete()` | 构造/启动错误或未来正常关闭 |
 | `hm01b0_capture_get_stats()` | 公开 API，当前 `main.c` 未调用 |
 
-`main/st7789_display.c` 当前没有加入 `main/CMakeLists.txt` 的 `SRCS`，因此
-其中的显示函数不属于阶段 1～3 的实际执行路径。
+本文件只记录阶段 1～3 的基线执行路径；当时
+`main/st7789_display.c` 尚未加入构建。Stage 4 已将它加入
+`main/CMakeLists.txt`，新增的静态帧路径见 `stage4_todo.md`。

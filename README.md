@@ -6,9 +6,9 @@ sensor on ESP32-S3.
 The repository currently contains the completed sensor-control foundation:
 external MCLK generation, 16-bit-address/8-bit-data I2C access, model-ID probe,
 register tables, operating modes, interface configuration, test patterns, and a
-standby/streaming state machine. The Stage 3 branch adds direct ESP32-S3 DVP
-capture with two internal DMA frame buffers; physical-board validation is still
-required before the stage is complete.
+standby/streaming state machine. It also contains direct ESP32-S3 DVP capture
+with two internal DMA frame buffers. Stage 4 adds a one-shot 240 x 240 grayscale
+snapshot on an SPI ST7789 while Camera RX continues running.
 
 ## Current status
 
@@ -16,12 +16,13 @@ required before the stage is complete.
 |---|---|---|
 | 1. MCLK + I2C | Complete | 12 MHz MCLK, I2C register access, `MODEL_ID=0x01B0` probe |
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
-| 3. DVP capture | Implemented, validation pending | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and Walking-1 observation |
-| 4. Display/application pipeline | Planned | Frame processing and optional LCD output |
+| 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and Walking-1 observation |
+| 4. Static ST7789 display | Implemented, validation pending | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 
-The current sample application initializes the sensor in standby, prepares the
+The current sample application initializes the sensor and ST7789, prepares the
 receiver and buffers, starts Camera RX, and only then starts HM01B0 streaming.
-It validates raw frames over serial logs and does not drive the ST7789.
+It validates raw frames over serial logs, copies one post-warm-up crop to an
+application snapshot, and displays that snapshot once without stopping capture.
 
 ## Initial sensor configuration
 
@@ -65,6 +66,20 @@ and the hardware checklist are recorded in [stage3_todo.md](stage3_todo.md).
 The detailed Stage 3 flow and the combined Stages 1-3 call sequence are
 recorded in [docs/execution-flow.md](docs/execution-flow.md).
 
+## Stage 4 static display configuration
+
+Stage 4 leaves the Stage 3 DVP transport and two DMA buffers unchanged. On the
+first size-valid frame after warm-up, the frame task copies the centered crop
+`x=42, y=2, 240 x 240` into a separate 57,600-byte internal-SRAM RAW8 snapshot.
+It returns the Camera DMA buffer before notifying `app_main`, so the one-time
+SPI display transfer cannot hold Buffer A or B.
+
+The ST7789 uses SPI2 at 40 MHz. `st7789_draw_gray_image()` converts the packed
+RAW8 snapshot to RGB565 in small chunks and writes the screen once. Camera RX
+and Stage 3 diagnostics continue afterward; ST7789 GRAM retains the static
+image. The detailed scope, ownership flow, expected logs, and hardware checks
+are recorded in [stage4_todo.md](stage4_todo.md).
+
 ### ESP-IDF 6.0 internal-SRAM compatibility
 
 ESP-IDF 6.0's DVP controller unconditionally calls
@@ -89,6 +104,14 @@ implementation. The installed ESP-IDF tree is not modified.
 | LVLD / HREF | 8 |
 | D0-D7 | 9-16 |
 
+| ST7789 signal | ESP32-S3 GPIO |
+|---|---:|
+| SCL / SPI clock | 35 |
+| SDA / MOSI | 36 |
+| RES | 37 |
+| DC | 38 |
+| CS | 39 |
+
 The GPIO mapping belongs to the sample board and is defined in
 `main/board_config.h`; the reusable sensor component receives its control pins
 through `hm01b0_config_t`.
@@ -107,12 +130,13 @@ components/hm01b0/
 components/hm01b0_capture/
   include/                 Capture lifecycle and statistics API
   hm01b0_capture.c         DVP controller, DMA buffers, queues, callbacks,
-                           validation task, and rate-limited diagnostics
+                           validation task, one-shot snapshot, and diagnostics
   hm01b0_cache_compat.c    ESP-IDF 6.0 internal-SRAM DVP cache workaround
 
 main/
   board_config.h           Sample board pin mapping
-  main.c                   Stage 3 receiver-first streaming application
+  main.c                   Receiver-first capture and static-display application
+  st7789_display.c/.h      SPI ST7789 initialization and pixel transfer
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
@@ -120,9 +144,6 @@ examples/
 docs/
   execution-flow.md        Detailed Stage 3 and combined Stages 1-3 call flow
 ```
-
-The ST7789 source files under `main/` are not part of the current build and are
-reserved for a later application/display stage.
 
 ## Public API
 
@@ -180,12 +201,13 @@ MODEL_ID_H=0x01, MODEL_ID_L=0xB0, MODEL_ID=0x01B0
 PASS: HM01B0 initialized in STANDBY
 ```
 
-Stage 3 then reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
+Stage 3 reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
 addresses, internal DMA heap usage, raw/active CRCs, compact samples from four
 active rows, and one summary per second. It never prints a complete frame.
-Hardware acceptance requires at least 60 seconds near 30 FPS with no size,
-starvation, or queue errors; Walking-1 is observed structurally until its exact
-byte sequence is established from hardware data.
+Stage 4 additionally reports the snapshot crop, copy/hold timing, source frame,
+and one-time LCD transfer duration. Hardware acceptance requires continued
+capture near 30 FPS with no size, starvation, or queue errors and a stable
+240 x 240 grayscale test-pattern image on the ST7789.
 
 Board-specific `sdkconfig` files and local editor/tool paths are intentionally
 not committed.
