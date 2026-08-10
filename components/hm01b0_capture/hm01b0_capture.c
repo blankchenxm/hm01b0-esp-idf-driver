@@ -192,6 +192,33 @@ static esp_err_t hm01b0_capture_validate_config(
                             config->raw_height - config->active_y,
                         ESP_ERR_INVALID_ARG, TAG,
                         "active area is outside the raw frame");
+    const bool snapshot_configured =
+        config->snapshot_buffer != NULL ||
+        config->snapshot_buffer_size != 0U ||
+        config->snapshot_width != 0U ||
+        config->snapshot_height != 0U ||
+        config->on_snapshot_ready != NULL;
+    if (snapshot_configured) {
+        const size_t snapshot_size =
+            (size_t)config->snapshot_width * config->snapshot_height;
+        ESP_RETURN_ON_FALSE(config->snapshot_buffer != NULL &&
+                            config->on_snapshot_ready != NULL &&
+                            config->snapshot_width > 0U &&
+                            config->snapshot_height > 0U,
+                            ESP_ERR_INVALID_ARG, TAG,
+                            "incomplete snapshot configuration");
+        ESP_RETURN_ON_FALSE(config->snapshot_x < config->raw_width &&
+                            config->snapshot_y < config->raw_height &&
+                            config->snapshot_width <=
+                                config->raw_width - config->snapshot_x &&
+                            config->snapshot_height <=
+                                config->raw_height - config->snapshot_y,
+                            ESP_ERR_INVALID_ARG, TAG,
+                            "snapshot area is outside the raw frame");
+        ESP_RETURN_ON_FALSE(config->snapshot_buffer_size >= snapshot_size,
+                            ESP_ERR_INVALID_SIZE, TAG,
+                            "snapshot buffer is too small");
+    }
     ESP_RETURN_ON_FALSE(GPIO_IS_VALID_GPIO(config->pclk_gpio) &&
                         GPIO_IS_VALID_GPIO(config->vsync_gpio) &&
                         GPIO_IS_VALID_GPIO(config->de_gpio),
@@ -472,20 +499,24 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
              "no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
              " free_err=%" PRIu32
              " process_last=%" PRIu32 "us process_max=%" PRIu32
+             "us hold_last=%" PRIu32 "us hold_max=%" PRIu32
              "us queues(free=%u,ready=%u)",
              handle->stats.no_free_buffer,
              handle->stats.ready_queue_overflows,
              handle->stats.free_queue_errors,
              handle->stats.last_processing_time_us,
              handle->stats.max_processing_time_us,
+             handle->stats.last_buffer_hold_time_us,
+             handle->stats.max_buffer_hold_time_us,
              (unsigned)uxQueueMessagesWaiting(handle->free_queue),
              (unsigned)uxQueueMessagesWaiting(handle->ready_queue));
 }
 
-static void hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
+static bool hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
                                          hm01b0_capture_frame_t *frame)
 {
     const int64_t start_us = esp_timer_get_time();
+    bool ready_for_snapshot = false;
     handle->stats.received_size = frame->received_size;
     handle->processed_frames++;
     bool size_valid = frame->received_size == handle->stats.payload_size;
@@ -571,6 +602,7 @@ static void hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
             analysis.one_hot_values;
         handle->stats.walking_sampled_other_values = analysis.other_values;
     }
+    ready_for_snapshot = true;
 
 finish:
     ;
@@ -580,6 +612,7 @@ finish:
     if (processing_time > handle->stats.max_processing_time_us) {
         handle->stats.max_processing_time_us = processing_time;
     }
+    return ready_for_snapshot;
 }
 
 static void hm01b0_capture_take_analysis_sample(
@@ -642,6 +675,22 @@ static void hm01b0_capture_log_first_analysis(
     }
 }
 
+static void hm01b0_capture_copy_snapshot(
+    const hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame)
+{
+    const size_t source_stride = handle->config.raw_width;
+    const size_t snapshot_stride = handle->config.snapshot_width;
+    for (uint16_t y = 0; y < handle->config.snapshot_height; ++y) {
+        const size_t source_offset =
+            (size_t)(handle->config.snapshot_y + y) * source_stride +
+            handle->config.snapshot_x;
+        const size_t snapshot_offset = (size_t)y * snapshot_stride;
+        memcpy(handle->config.snapshot_buffer + snapshot_offset,
+               frame->data + source_offset, snapshot_stride);
+    }
+}
+
 static void hm01b0_capture_task(void *arg)
 {
     hm01b0_capture_handle_t *handle = arg;
@@ -663,13 +712,16 @@ static void hm01b0_capture_task(void *arg)
         if (frame == NULL) {
             continue;
         }
+        const int64_t buffer_hold_start_us = esp_timer_get_time();
         handle->processing_frame = true;
 
         hm01b0_analysis_sample_t first_sample;
         bool log_first_analysis = false;
+        bool notify_snapshot_ready = false;
         const uint32_t analyses_before =
             handle->stats.walking_analysis_frames;
-        hm01b0_capture_process_frame(handle, frame);
+        const bool ready_for_snapshot =
+            hm01b0_capture_process_frame(handle, frame);
         if (!handle->first_analysis_logged &&
             handle->stats.walking_analysis_frames > analyses_before) {
             hm01b0_capture_take_analysis_sample(handle, frame,
@@ -678,13 +730,60 @@ static void hm01b0_capture_task(void *arg)
             log_first_analysis = true;
         }
 
-        if (xQueueSend(handle->free_queue, &frame, 0) != pdPASS) {
+        if (ready_for_snapshot &&
+            handle->config.snapshot_buffer != NULL &&
+            !handle->stats.snapshot_captured) {
+            const int64_t snapshot_start_us = esp_timer_get_time();
+            hm01b0_capture_copy_snapshot(handle, frame);
+            handle->stats.snapshot_copy_time_us = (uint32_t)(
+                esp_timer_get_time() - snapshot_start_us);
+            handle->stats.snapshot_sequence = frame->sequence;
+            handle->stats.snapshot_size =
+                (size_t)handle->config.snapshot_width *
+                handle->config.snapshot_height;
+            handle->stats.snapshot_captured = true;
+            notify_snapshot_ready = true;
+        }
+
+        const bool frame_returned =
+            xQueueSend(handle->free_queue, &frame, 0) == pdPASS;
+        if (!frame_returned) {
             handle->task_free_queue_errors++;
+        }
+        const uint32_t buffer_hold_time_us = (uint32_t)(
+            esp_timer_get_time() - buffer_hold_start_us);
+        handle->stats.last_buffer_hold_time_us = buffer_hold_time_us;
+        if (buffer_hold_time_us > handle->stats.max_buffer_hold_time_us) {
+            handle->stats.max_buffer_hold_time_us = buffer_hold_time_us;
         }
         handle->processing_frame = false;
 
         if (log_first_analysis) {
             hm01b0_capture_log_first_analysis(&first_sample);
+        }
+        if (notify_snapshot_ready && frame_returned) {
+            ESP_LOGI(TAG,
+                     "snapshot ready: frame=%" PRIu32
+                     " crop=(%u,%u %ux%u), bytes=%u, copy=%" PRIu32
+                     "us, buffer_hold=%" PRIu32 "us",
+                     handle->stats.snapshot_sequence,
+                     (unsigned)handle->config.snapshot_x,
+                     (unsigned)handle->config.snapshot_y,
+                     (unsigned)handle->config.snapshot_width,
+                     (unsigned)handle->config.snapshot_height,
+                     (unsigned)handle->stats.snapshot_size,
+                     handle->stats.snapshot_copy_time_us,
+                     handle->stats.last_buffer_hold_time_us);
+            handle->config.on_snapshot_ready(
+                handle->config.snapshot_buffer,
+                handle->config.snapshot_width,
+                handle->config.snapshot_height,
+                handle->stats.snapshot_sequence,
+                handle->config.snapshot_user_data);
+        } else if (notify_snapshot_ready) {
+            ESP_LOGE(TAG,
+                     "snapshot frame was not returned to the free queue; "
+                     "display notification suppressed");
         }
 
         const int64_t now_us = esp_timer_get_time();
@@ -885,6 +984,17 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
              config->active_width, config->active_height,
              (unsigned)handle->stats.active_payload_size,
              handle->config.warmup_frames);
+    if (config->snapshot_buffer != NULL) {
+        ESP_LOGI(TAG,
+                 "one-shot snapshot: crop=(%u,%u %ux%u), buffer=%p, "
+                 "capacity=%u bytes",
+                 (unsigned)config->snapshot_x,
+                 (unsigned)config->snapshot_y,
+                 (unsigned)config->snapshot_width,
+                 (unsigned)config->snapshot_height,
+                 config->snapshot_buffer,
+                 (unsigned)config->snapshot_buffer_size);
+    }
     hm01b0_capture_log_memory(handle);
 
     *out_handle = handle;

@@ -16,6 +16,14 @@ extern "C" {
 
 typedef struct hm01b0_capture hm01b0_capture_handle_t;
 
+/* Called from the frame task after the Camera DMA Buffer has been returned. */
+typedef void (*hm01b0_capture_snapshot_ready_cb_t)(
+    const uint8_t *buffer,
+    uint16_t width,
+    uint16_t height,
+    uint32_t sequence,
+    void *user_data);
+
 typedef struct {
     gpio_num_t data_gpio[8];
     gpio_num_t pclk_gpio;
@@ -39,6 +47,16 @@ typedef struct {
     uint32_t warmup_frames;
     /* Observe Walking-1 geometry; this is not an exact byte-sequence test. */
     bool analyze_walking_1;
+
+    /* Optional one-shot RAW8 snapshot copied after warm-up. */
+    uint8_t *snapshot_buffer;
+    size_t snapshot_buffer_size;
+    uint16_t snapshot_x;
+    uint16_t snapshot_y;
+    uint16_t snapshot_width;
+    uint16_t snapshot_height;
+    hm01b0_capture_snapshot_ready_cb_t on_snapshot_ready;
+    void *snapshot_user_data;
 } hm01b0_capture_config_t;
 
 typedef struct {
@@ -79,8 +97,14 @@ typedef struct {
     uint32_t walking_sampled_zero_values;
     uint32_t walking_sampled_one_hot_values;
     uint32_t walking_sampled_other_values;
+    bool snapshot_captured;
+    uint32_t snapshot_sequence;
+    size_t snapshot_size;
+    uint32_t snapshot_copy_time_us;
     uint32_t last_processing_time_us;
     uint32_t max_processing_time_us;
+    uint32_t last_buffer_hold_time_us;
+    uint32_t max_buffer_hold_time_us;
     uint32_t fps_milli;
 } hm01b0_capture_stats_t;
 
