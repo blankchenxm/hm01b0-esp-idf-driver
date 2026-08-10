@@ -22,7 +22,8 @@
 #define HM01B0_CAPTURE_DEFAULT_STATS_PERIOD_MS 1000U
 #define HM01B0_CAPTURE_DEFAULT_WARMUP_FRAMES   5U
 #define HM01B0_CAPTURE_FIRST_SAMPLE_SIZE       32U
-#define HM01B0_CAPTURE_WALKING_SAMPLE_ROWS     4U
+#define HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS     4U
+#define HM01B0_CAPTURE_COLOR_BAR_STRONG_DELTA  8U
 #define HM01B0_CAPTURE_QUEUE_WAIT_MS           100U
 #define HM01B0_CAPTURE_TASK_STOP_TIMEOUT_MS    500U
 
@@ -45,6 +46,21 @@ typedef struct {
 } hm01b0_walking_analysis_t;
 
 typedef struct {
+    uint32_t sampled_rows;
+    uint32_t rows_equal;
+    uint32_t rows_compared;
+    uint32_t vertical_mismatches;
+    uint32_t horizontal_transitions;
+    uint32_t strong_transitions;
+    uint32_t unique_values;
+    uint32_t center_changes;
+    uint32_t center_vertical_mismatches;
+    uint8_t min_value;
+    uint8_t max_value;
+    uint8_t center_values[HM01B0_CAPTURE_COLOR_BAR_COUNT];
+} hm01b0_color_bar_analysis_t;
+
+typedef struct {
     uint32_t sequence;
     uint32_t warmup_frames;
     size_t received_size;
@@ -54,9 +70,9 @@ typedef struct {
     size_t active_sample_size;
     uint16_t active_x;
     size_t active_row_count;
-    uint16_t active_rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS];
+    uint16_t active_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS];
     uint8_t raw[HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
-    uint8_t active[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS]
+    uint8_t active[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS]
                   [HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
 } hm01b0_analysis_sample_t;
 
@@ -108,6 +124,21 @@ struct hm01b0_capture {
 };
 
 static const char *TAG = "hm01b0_capture";
+
+static const char *hm01b0_capture_pattern_analysis_name(
+    hm01b0_capture_pattern_analysis_t analysis)
+{
+    switch (analysis) {
+    case HM01B0_CAPTURE_PATTERN_ANALYSIS_NONE:
+        return "none";
+    case HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1:
+        return "Walking-1";
+    case HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR:
+        return "Color-Bar";
+    default:
+        return "invalid";
+    }
+}
 
 static bool IRAM_ATTR hm01b0_capture_on_get_new_trans(
     esp_cam_ctlr_handle_t cam_handle,
@@ -192,6 +223,11 @@ static esp_err_t hm01b0_capture_validate_config(
                             config->raw_height - config->active_y,
                         ESP_ERR_INVALID_ARG, TAG,
                         "active area is outside the raw frame");
+    ESP_RETURN_ON_FALSE(
+        config->pattern_analysis >= HM01B0_CAPTURE_PATTERN_ANALYSIS_NONE &&
+        config->pattern_analysis <=
+            HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR,
+        ESP_ERR_INVALID_ARG, TAG, "invalid test-pattern analysis mode");
     const bool snapshot_configured =
         config->snapshot_buffer != NULL ||
         config->snapshot_buffer_size != 0U ||
@@ -311,12 +347,12 @@ static bool hm01b0_is_one_hot(uint8_t value)
     return value != 0U && (value & (uint8_t)(value - 1U)) == 0U;
 }
 
-static size_t hm01b0_select_walking_sample_rows(
+static size_t hm01b0_select_pattern_sample_rows(
     uint16_t active_y,
     uint16_t active_height,
-    uint16_t rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS])
+    uint16_t rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS])
 {
-    const uint16_t offsets[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS] = {
+    const uint16_t offsets[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {
         0U,
         active_height > 1U ? 1U : 0U,
         (uint16_t)(active_height / 2U),
@@ -324,7 +360,7 @@ static size_t hm01b0_select_walking_sample_rows(
     };
     size_t count = 0U;
 
-    for (size_t i = 0; i < HM01B0_CAPTURE_WALKING_SAMPLE_ROWS; ++i) {
+    for (size_t i = 0; i < HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS; ++i) {
         const uint16_t row = (uint16_t)(active_y + offsets[i]);
         bool duplicate = false;
         for (size_t j = 0; j < count; ++j) {
@@ -367,14 +403,14 @@ static hm01b0_walking_analysis_t hm01b0_analyze_walking_one(
 {
     hm01b0_walking_analysis_t result = {0};
     uint32_t seen_values[8] = {0};
-    uint16_t sample_rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS] = {0};
+    uint16_t sample_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {0};
 
     if (data == NULL || stride == 0U || active_width == 0U ||
         active_height == 0U) {
         return result;
     }
 
-    const size_t sample_count = hm01b0_select_walking_sample_rows(
+    const size_t sample_count = hm01b0_select_pattern_sample_rows(
         active_y, active_height, sample_rows);
     result.sampled_rows = (uint32_t)sample_count;
 
@@ -416,6 +452,108 @@ static hm01b0_walking_analysis_t hm01b0_analyze_walking_one(
             result.rows_compared++;
             if (row_equal) {
                 result.rows_equal++;
+            }
+        }
+    }
+
+    return result;
+}
+
+/*
+ * The datasheet defines six vertical bars but not their exact RAW8 codes.
+ * Observe representative-row consistency and horizontal structure without
+ * turning undocumented byte values into pass/fail criteria.
+ */
+static hm01b0_color_bar_analysis_t hm01b0_analyze_color_bar(
+    const uint8_t *data,
+    uint16_t stride,
+    uint16_t active_x,
+    uint16_t active_y,
+    uint16_t active_width,
+    uint16_t active_height)
+{
+    hm01b0_color_bar_analysis_t result = {
+        .min_value = UINT8_MAX,
+    };
+    uint32_t seen_values[8] = {0};
+    uint16_t sample_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {0};
+
+    if (data == NULL || stride == 0U || active_width == 0U ||
+        active_height == 0U) {
+        result.min_value = 0U;
+        return result;
+    }
+
+    const size_t sample_count = hm01b0_select_pattern_sample_rows(
+        active_y, active_height, sample_rows);
+    result.sampled_rows = (uint32_t)sample_count;
+
+    const uint8_t *reference = data +
+                               (size_t)sample_rows[0] * stride + active_x;
+    for (uint16_t x = 1U; x < active_width; ++x) {
+        if (reference[x] != reference[x - 1U]) {
+            result.horizontal_transitions++;
+        }
+        const unsigned delta = reference[x] > reference[x - 1U]
+                                   ? reference[x] - reference[x - 1U]
+                                   : reference[x - 1U] - reference[x];
+        if (delta >= HM01B0_CAPTURE_COLOR_BAR_STRONG_DELTA) {
+            result.strong_transitions++;
+        }
+    }
+
+    uint16_t center_offsets[HM01B0_CAPTURE_COLOR_BAR_COUNT] = {0};
+    for (size_t bar = 0; bar < HM01B0_CAPTURE_COLOR_BAR_COUNT; ++bar) {
+        const uint32_t numerator =
+            (uint32_t)(2U * bar + 1U) * active_width;
+        uint16_t center = (uint16_t)(
+            numerator / (2U * HM01B0_CAPTURE_COLOR_BAR_COUNT));
+        if (center >= active_width) {
+            center = (uint16_t)(active_width - 1U);
+        }
+        center_offsets[bar] = center;
+        result.center_values[bar] = reference[center];
+        if (bar > 0U &&
+            result.center_values[bar] != result.center_values[bar - 1U]) {
+            result.center_changes++;
+        }
+    }
+
+    for (size_t sample_index = 0; sample_index < sample_count;
+         ++sample_index) {
+        const uint8_t *row = data +
+                             (size_t)sample_rows[sample_index] * stride +
+                             active_x;
+        bool row_equal = true;
+        for (uint16_t x = 0; x < active_width; ++x) {
+            const uint8_t value = row[x];
+            const uint32_t value_bit = 1UL << (value & 31U);
+            uint32_t *const seen_word = &seen_values[value >> 5U];
+            if ((*seen_word & value_bit) == 0U) {
+                *seen_word |= value_bit;
+                result.unique_values++;
+            }
+            if (value < result.min_value) {
+                result.min_value = value;
+            }
+            if (value > result.max_value) {
+                result.max_value = value;
+            }
+            if (sample_index > 0U && value != reference[x]) {
+                result.vertical_mismatches++;
+                row_equal = false;
+            }
+        }
+        if (sample_index > 0U) {
+            result.rows_compared++;
+            if (row_equal) {
+                result.rows_equal++;
+            }
+            for (size_t bar = 0; bar < HM01B0_CAPTURE_COLOR_BAR_COUNT;
+                 ++bar) {
+                if (row[center_offsets[bar]] != result.center_values[bar]) {
+                    result.center_vertical_mismatches++;
+                }
             }
         }
     }
@@ -476,7 +614,8 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
              handle->stats.raw_crc_changes,
              handle->stats.active_crc_changes,
              handle->stats.active_crc_frame_changes);
-    if (handle->config.analyze_walking_1 &&
+    if (handle->config.pattern_analysis ==
+            HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1 &&
         handle->stats.walking_analysis_frames > 0U) {
         ESP_LOGI(TAG,
                  "Walking-1 observe sampled_rows=%" PRIu32
@@ -494,6 +633,35 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
                  handle->stats.walking_sampled_zero_values,
                  handle->stats.walking_sampled_one_hot_values,
                  handle->stats.walking_sampled_other_values);
+    } else if (handle->config.pattern_analysis ==
+                   HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR &&
+               handle->stats.color_bar_analysis_frames > 0U) {
+        ESP_LOGI(TAG,
+                 "Color-Bar observe sampled_rows=%" PRIu32
+                 " equal=%" PRIu32 "/%" PRIu32
+                 " sampled_vertical_mismatch=%" PRIu32
+                 " transitions=%" PRIu32 " strong=%" PRIu32
+                 " sampled_unique=%" PRIu32 " range=%02X..%02X",
+                 handle->stats.color_bar_sampled_rows,
+                 handle->stats.color_bar_sampled_rows_equal,
+                 handle->stats.color_bar_sampled_rows_compared,
+                 handle->stats.color_bar_sampled_vertical_mismatches,
+                 handle->stats.color_bar_horizontal_transitions,
+                 handle->stats.color_bar_strong_transitions,
+                 handle->stats.color_bar_sampled_unique_values,
+                 (unsigned)handle->stats.color_bar_min_value,
+                 (unsigned)handle->stats.color_bar_max_value);
+        ESP_LOGI(TAG,
+                 "Color-Bar centers=[%02X %02X %02X %02X %02X %02X] "
+                 "changes=%" PRIu32 "/5 center_vertical_mismatch=%" PRIu32,
+                 (unsigned)handle->stats.color_bar_center_values[0],
+                 (unsigned)handle->stats.color_bar_center_values[1],
+                 (unsigned)handle->stats.color_bar_center_values[2],
+                 (unsigned)handle->stats.color_bar_center_values[3],
+                 (unsigned)handle->stats.color_bar_center_values[4],
+                 (unsigned)handle->stats.color_bar_center_values[5],
+                 handle->stats.color_bar_center_changes,
+                 handle->stats.color_bar_center_vertical_mismatches);
     }
     ESP_LOGI(TAG,
              "no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
@@ -580,7 +748,8 @@ static bool hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
     handle->previous_active_crc = active_crc;
     handle->previous_active_crc_valid = true;
 
-    if (handle->config.analyze_walking_1) {
+    if (handle->config.pattern_analysis ==
+        HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1) {
         const hm01b0_walking_analysis_t analysis =
             hm01b0_analyze_walking_one(
                 frame->data, handle->config.raw_width,
@@ -601,6 +770,33 @@ static bool hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
         handle->stats.walking_sampled_one_hot_values =
             analysis.one_hot_values;
         handle->stats.walking_sampled_other_values = analysis.other_values;
+    } else if (handle->config.pattern_analysis ==
+               HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR) {
+        const hm01b0_color_bar_analysis_t analysis =
+            hm01b0_analyze_color_bar(
+                frame->data, handle->config.raw_width,
+                handle->config.active_x, handle->config.active_y,
+                handle->config.active_width, handle->config.active_height);
+        handle->stats.color_bar_analysis_frames++;
+        handle->stats.color_bar_sampled_rows = analysis.sampled_rows;
+        handle->stats.color_bar_sampled_rows_equal = analysis.rows_equal;
+        handle->stats.color_bar_sampled_rows_compared =
+            analysis.rows_compared;
+        handle->stats.color_bar_sampled_vertical_mismatches =
+            analysis.vertical_mismatches;
+        handle->stats.color_bar_horizontal_transitions =
+            analysis.horizontal_transitions;
+        handle->stats.color_bar_strong_transitions =
+            analysis.strong_transitions;
+        handle->stats.color_bar_sampled_unique_values =
+            analysis.unique_values;
+        handle->stats.color_bar_center_changes = analysis.center_changes;
+        handle->stats.color_bar_center_vertical_mismatches =
+            analysis.center_vertical_mismatches;
+        handle->stats.color_bar_min_value = analysis.min_value;
+        handle->stats.color_bar_max_value = analysis.max_value;
+        memcpy(handle->stats.color_bar_center_values,
+               analysis.center_values, sizeof(analysis.center_values));
     }
     ready_for_snapshot = true;
 
@@ -634,7 +830,7 @@ static void hm01b0_capture_take_analysis_sample(
             ? handle->config.active_width
             : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
     sample->active_x = handle->config.active_x;
-    sample->active_row_count = hm01b0_select_walking_sample_rows(
+    sample->active_row_count = hm01b0_select_pattern_sample_rows(
         handle->config.active_y, handle->config.active_height,
         sample->active_rows);
 
@@ -718,12 +914,9 @@ static void hm01b0_capture_task(void *arg)
         hm01b0_analysis_sample_t first_sample;
         bool log_first_analysis = false;
         bool notify_snapshot_ready = false;
-        const uint32_t analyses_before =
-            handle->stats.walking_analysis_frames;
         const bool ready_for_snapshot =
             hm01b0_capture_process_frame(handle, frame);
-        if (!handle->first_analysis_logged &&
-            handle->stats.walking_analysis_frames > analyses_before) {
+        if (!handle->first_analysis_logged && ready_for_snapshot) {
             hm01b0_capture_take_analysis_sample(handle, frame,
                                                  &first_sample);
             handle->first_analysis_logged = true;
@@ -979,11 +1172,14 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
              config->dma_burst_size);
     ESP_LOGI(TAG,
              "analysis area=(%u,%u %ux%u), active_payload=%u, warmup=%" PRIu32
-             "; DMA still captures the complete raw frame without cropping",
+             ", pattern=%s; DMA still captures the complete raw frame "
+             "without cropping",
              config->active_x, config->active_y,
              config->active_width, config->active_height,
              (unsigned)handle->stats.active_payload_size,
-             handle->config.warmup_frames);
+             handle->config.warmup_frames,
+             hm01b0_capture_pattern_analysis_name(
+                 handle->config.pattern_analysis));
     if (config->snapshot_buffer != NULL) {
         ESP_LOGI(TAG,
                  "one-shot snapshot: crop=(%u,%u %ux%u), buffer=%p, "

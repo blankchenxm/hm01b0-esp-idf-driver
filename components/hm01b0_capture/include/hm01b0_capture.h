@@ -13,8 +13,15 @@ extern "C" {
 #endif
 
 #define HM01B0_CAPTURE_BUFFER_COUNT 2U
+#define HM01B0_CAPTURE_COLOR_BAR_COUNT 6U
 
 typedef struct hm01b0_capture hm01b0_capture_handle_t;
+
+typedef enum {
+    HM01B0_CAPTURE_PATTERN_ANALYSIS_NONE = 0,
+    HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1,
+    HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR,
+} hm01b0_capture_pattern_analysis_t;
 
 /* Called from the frame task after the Camera DMA Buffer has been returned. */
 typedef void (*hm01b0_capture_snapshot_ready_cb_t)(
@@ -45,8 +52,8 @@ typedef struct {
     uint32_t stats_period_ms;
     /* Zero selects the component default of five startup frames. */
     uint32_t warmup_frames;
-    /* Observe Walking-1 geometry; this is not an exact byte-sequence test. */
-    bool analyze_walking_1;
+    /* Observe test-pattern structure; neither mode assumes exact RAW8 values. */
+    hm01b0_capture_pattern_analysis_t pattern_analysis;
 
     /* Optional one-shot RAW8 snapshot copied after warm-up. */
     uint8_t *snapshot_buffer;
@@ -97,6 +104,19 @@ typedef struct {
     uint32_t walking_sampled_zero_values;
     uint32_t walking_sampled_one_hot_values;
     uint32_t walking_sampled_other_values;
+    uint32_t color_bar_analysis_frames;
+    uint32_t color_bar_sampled_rows;
+    uint32_t color_bar_sampled_rows_equal;
+    uint32_t color_bar_sampled_rows_compared;
+    uint32_t color_bar_sampled_vertical_mismatches;
+    uint32_t color_bar_horizontal_transitions;
+    uint32_t color_bar_strong_transitions;
+    uint32_t color_bar_sampled_unique_values;
+    uint32_t color_bar_center_changes;
+    uint32_t color_bar_center_vertical_mismatches;
+    uint8_t color_bar_min_value;
+    uint8_t color_bar_max_value;
+    uint8_t color_bar_center_values[HM01B0_CAPTURE_COLOR_BAR_COUNT];
     bool snapshot_captured;
     uint32_t snapshot_sequence;
     size_t snapshot_size;

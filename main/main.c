@@ -27,6 +27,11 @@
 #define HM01B0_CAPTURE_STATS_PERIOD_MS 1000U
 #define HM01B0_CAPTURE_WARMUP_FRAMES      5U
 
+#define HM01B0_STAGE4_TEST_PATTERN       HM01B0_TEST_PATTERN_COLOR_BAR
+#define HM01B0_STAGE4_PATTERN_ANALYSIS   \
+    HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR
+#define HM01B0_STAGE4_TEST_PATTERN_NAME  "Color-Bar"
+
 #define HM01B0_SNAPSHOT_X                 42U
 #define HM01B0_SNAPSHOT_Y                  2U
 #define HM01B0_SNAPSHOT_WIDTH            240U
@@ -80,7 +85,7 @@ void app_main(void)
         .enable_internal_i2c_pullups = true,
         .initial_mode = HM01B0_SENSOR_MODE_QVGA,
         .data_interface = HM01B0_DATA_INTERFACE_8_BIT,
-        .test_pattern = HM01B0_TEST_PATTERN_WALKING_1,
+        .test_pattern = HM01B0_STAGE4_TEST_PATTERN,
     };
 
     esp_err_t ret = hm01b0_new(&config, &s_sensor);
@@ -156,7 +161,7 @@ void app_main(void)
         .task_priority = HM01B0_CAPTURE_TASK_PRIORITY,
         .stats_period_ms = HM01B0_CAPTURE_STATS_PERIOD_MS,
         .warmup_frames = HM01B0_CAPTURE_WARMUP_FRAMES,
-        .analyze_walking_1 = true,
+        .pattern_analysis = HM01B0_STAGE4_PATTERN_ANALYSIS,
         .snapshot_buffer = s_snapshot,
         .snapshot_buffer_size = HM01B0_SNAPSHOT_SIZE,
         .snapshot_x = HM01B0_SNAPSHOT_X,
@@ -206,8 +211,13 @@ void app_main(void)
     }
 
     ESP_LOGI(TAG,
-             "Stage 4 running: waiting for one post-warm-up Walking-1 "
-             "snapshot while Camera RX continues");
+             "Stage 4 running: waiting for one post-warm-up %s snapshot "
+             "while Camera RX continues",
+             HM01B0_STAGE4_TEST_PATTERN_NAME);
+    ESP_LOGI(TAG,
+             "Color-Bar analysis uses the complete 320-pixel active row; "
+             "the 240-pixel LCD center crop removes 40 columns per side "
+             "and displays RAW8 bars as grayscale");
 
     (void)ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
@@ -219,8 +229,9 @@ void app_main(void)
     const uint32_t display_time_us = (uint32_t)(
         esp_timer_get_time() - display_start_us);
     ESP_LOGI(TAG,
-             "Stage 4 static frame displayed: source_frame=%" PRIu32
+             "Stage 4 %s static frame displayed: source_frame=%" PRIu32
              ", destination=(0,0 240x240), display=%" PRIu32 "us",
+             HM01B0_STAGE4_TEST_PATTERN_NAME,
              s_snapshot_sequence, display_time_us);
 
     /* ST7789 GRAM retains the snapshot while Camera RX keeps running. */
