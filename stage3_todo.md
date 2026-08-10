@@ -51,14 +51,15 @@ and monitored.
 - [x] Compare CRCs against the first post-warm-up frame and compare active CRC
   against the immediately previous frame.
 - [x] Observe Walking-1 without assuming an undocumented byte sequence:
-  equal rows, vertical mismatches, first-row horizontal transitions, unique
-  values, and zero/one-hot/other value counts.
+  sample active rows y=0, y=1, the middle row and the final row; report sampled
+  row equality, vertical mismatches, first-row horizontal transitions, unique
+  values, and zero/one-hot/other counts.
 - [x] Treat exact received length as transport validity. CRC and Walking-1
   observations no longer invalidate an otherwise complete DMA frame.
 - [x] Track frame sequence, stable received size, measured FPS, queue errors,
   and last/maximum processing time.
 - [x] Print configuration and memory information once at startup.
-- [x] After warm-up, print small samples from the raw first row and three active
+- [x] After warm-up, print small samples from the raw first row and four active
   rows once; never print a complete frame.
 - [x] Print a rate-limited statistics summary once per second.
 - [x] Rate-limit error details and include the first mismatch coordinate.
@@ -103,3 +104,18 @@ and monitored.
 - [x] Added a project-local linker wrapper which treats only the internal-RAM
   M2C `ESP_ERR_NOT_SUPPORTED` case as a successful no-op. The ESP-IDF
   installation remains unchanged; hardware re-test is pending.
+
+## Walking-1 analysis run - 2026-08-10
+
+- [x] TEST_PATTERN_MODE read back as `0x11`.
+- [x] Camera RX and HM01B0 streaming both started successfully.
+- [x] Full 320x244 Walking-1 traversal held one application Buffer beyond the
+  next frame boundary, leaving no free Buffer while driver backup was disabled.
+- [x] The ESP-IDF DVP driver asserted with `no new buffer, and no driver
+  internal buffer`; the backtrace showed the frame task still inside
+  `hm01b0_analyze_walking_one()`.
+- [x] Reduce Walking-1 structure/value traversal to active rows y=0, y=1, the
+  middle row and the final row. Raw and active CRCs still cover their complete
+  regions; two application Buffers and disabled driver backup are unchanged.
+- [ ] Rebuild, flash and confirm `process_max` stays below 33.3 ms without
+  Buffer starvation.

@@ -325,10 +325,11 @@ Frame A 被放入 `ready_queue` 后：
 10. 第一张 warm-up 后的帧建立 raw/active CRC 基准；active CRC 还会与
     前一帧比较，区分“始终不同于基准”和“相邻帧发生变化”。
 11. 开启 Walking-1 观察时，调用 `hm01b0_analyze_walking_one()`：
-    - 只分析 x=2、y=0、320x244，不复制或裁剪 DMA Buffer；
-    - 比较后 243 行与第一行，统计相同行数和垂直 mismatch；
+    - 在 x=2、width=320 内只选择 y=0、y=1、中间和最后一行；
+    - 比较其余 3 条代表行与第一条代表行，统计相同行数和垂直 mismatch；
     - 统计第一行水平方向的数值跳变次数；
-    - 统计 unique、zero、one-hot 和 other 数值数量；
+    - 只对 4 条代表行统计 unique、zero、one-hot 和 other 数值数量；
+    - 遍历量从 320x244 降为 320x4；完整帧和有效区 CRC 仍覆盖全部数据；
     - 不再假定 datasheet 未定义的逐像素 one-hot 循环序列。
 12. 需要输出长度错误时调用
     `hm01b0_capture_error_log_allowed()`，把错误日志限制为每秒最多一次。
@@ -336,10 +337,10 @@ Frame A 被放入 `ready_queue` 后：
 14. 记录 `last_processing_time_us`，必要时更新
     `max_processing_time_us`。
 15. 从 `hm01b0_capture_process_frame()` 返回。
-16. 第一张分析帧先复制 raw 第一行和 active 顶部/中部/底部各
-    32 bytes 到任务栈上的小快照。
+16. 第一张分析帧先复制 raw 第一行，以及 active y=0、y=1、中间和
+    最后一行各 32 bytes 到任务栈上的小快照。
 17. 调用 `xQueueSend(free_queue, &frame, 0)`，将 A 归还空闲池。
-18. 设置 `processing_frame = false`，再从小快照打印四组样本；只打印
+18. 设置 `processing_frame = false`，再从小快照打印五组样本；只打印
     一次，不占用 DMA Buffer 输出串口，也不输出完整帧。
 19. 达到统计周期时调用 `hm01b0_capture_log_stats()`：
     - 快照 ISR 计数；
@@ -787,10 +788,11 @@ hm01b0_stop(sensor)
 | `hm01b0_capture_task()` | 持续运行的 FreeRTOS Task |
 | `hm01b0_capture_process_frame()` | 每个从 ready_queue 取出的帧 |
 | `hm01b0_capture_active_crc()` | warm-up 后逐行计算 320x244 active CRC |
-| `hm01b0_analyze_walking_one()` | warm-up 后观察有效区行结构和值分布 |
+| `hm01b0_select_walking_sample_rows()` | 选择 active 顶部两行、中间行和最后一行 |
+| `hm01b0_analyze_walking_one()` | warm-up 后只观察四条代表行的结构和值分布 |
 | `hm01b0_is_one_hot()` | Walking-1 值分类，不再作为整帧硬性判错条件 |
-| `hm01b0_capture_take_analysis_sample()` | 归还 DMA Buffer 前复制四组 32-byte 小样本 |
-| `hm01b0_capture_log_first_analysis()` | 仅第一张分析帧输出四组小样本 |
+| `hm01b0_capture_take_analysis_sample()` | 归还 DMA Buffer 前复制五组 32-byte 小样本 |
+| `hm01b0_capture_log_first_analysis()` | 仅第一张分析帧输出五组小样本 |
 | `hm01b0_capture_error_log_allowed()` | 有详细错误需要打印时 |
 | `hm01b0_capture_log_stats()` | 每个统计周期，包括无帧情况 |
 | `hm01b0_capture_stop()` | 启动错误或未来正常关闭 |

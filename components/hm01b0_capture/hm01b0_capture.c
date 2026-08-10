@@ -22,6 +22,7 @@
 #define HM01B0_CAPTURE_DEFAULT_STATS_PERIOD_MS 1000U
 #define HM01B0_CAPTURE_DEFAULT_WARMUP_FRAMES   5U
 #define HM01B0_CAPTURE_FIRST_SAMPLE_SIZE       32U
+#define HM01B0_CAPTURE_WALKING_SAMPLE_ROWS     4U
 #define HM01B0_CAPTURE_QUEUE_WAIT_MS           100U
 #define HM01B0_CAPTURE_TASK_STOP_TIMEOUT_MS    500U
 
@@ -32,6 +33,7 @@ typedef struct {
 } hm01b0_capture_frame_t;
 
 typedef struct {
+    uint32_t sampled_rows;
     uint32_t rows_equal;
     uint32_t rows_compared;
     uint32_t vertical_mismatches;
@@ -51,9 +53,11 @@ typedef struct {
     size_t raw_sample_size;
     size_t active_sample_size;
     uint16_t active_x;
-    uint16_t active_rows[3];
+    size_t active_row_count;
+    uint16_t active_rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS];
     uint8_t raw[HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
-    uint8_t active[3][HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
+    uint8_t active[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS]
+                  [HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
 } hm01b0_analysis_sample_t;
 
 struct hm01b0_capture {
@@ -280,6 +284,36 @@ static bool hm01b0_is_one_hot(uint8_t value)
     return value != 0U && (value & (uint8_t)(value - 1U)) == 0U;
 }
 
+static size_t hm01b0_select_walking_sample_rows(
+    uint16_t active_y,
+    uint16_t active_height,
+    uint16_t rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS])
+{
+    const uint16_t offsets[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS] = {
+        0U,
+        active_height > 1U ? 1U : 0U,
+        (uint16_t)(active_height / 2U),
+        (uint16_t)(active_height - 1U),
+    };
+    size_t count = 0U;
+
+    for (size_t i = 0; i < HM01B0_CAPTURE_WALKING_SAMPLE_ROWS; ++i) {
+        const uint16_t row = (uint16_t)(active_y + offsets[i]);
+        bool duplicate = false;
+        for (size_t j = 0; j < count; ++j) {
+            if (rows[j] == row) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) {
+            rows[count++] = row;
+        }
+    }
+
+    return count;
+}
+
 static uint32_t hm01b0_capture_active_crc(
     const hm01b0_capture_handle_t *handle,
     const uint8_t *data)
@@ -306,22 +340,30 @@ static hm01b0_walking_analysis_t hm01b0_analyze_walking_one(
 {
     hm01b0_walking_analysis_t result = {0};
     uint32_t seen_values[8] = {0};
+    uint16_t sample_rows[HM01B0_CAPTURE_WALKING_SAMPLE_ROWS] = {0};
 
     if (data == NULL || stride == 0U || active_width == 0U ||
         active_height == 0U) {
         return result;
     }
 
-    const uint8_t *reference = data + (size_t)active_y * stride + active_x;
+    const size_t sample_count = hm01b0_select_walking_sample_rows(
+        active_y, active_height, sample_rows);
+    result.sampled_rows = (uint32_t)sample_count;
+
+    const uint8_t *reference = data +
+                               (size_t)sample_rows[0] * stride + active_x;
     for (uint16_t x = 0; x < active_width; ++x) {
         if (x > 0U && reference[x] != reference[x - 1U]) {
             result.horizontal_transitions++;
         }
     }
 
-    for (uint16_t y = 0; y < active_height; ++y) {
+    for (size_t sample_index = 0; sample_index < sample_count;
+         ++sample_index) {
         const uint8_t *row = data +
-                             (size_t)(active_y + y) * stride + active_x;
+                             (size_t)sample_rows[sample_index] * stride +
+                             active_x;
         bool row_equal = true;
         for (uint16_t x = 0; x < active_width; ++x) {
             const uint8_t value = row[x];
@@ -338,12 +380,12 @@ static hm01b0_walking_analysis_t hm01b0_analyze_walking_one(
             } else {
                 result.other_values++;
             }
-            if (y > 0U && value != reference[x]) {
+            if (sample_index > 0U && value != reference[x]) {
                 result.vertical_mismatches++;
                 row_equal = false;
             }
         }
-        if (y > 0U) {
+        if (sample_index > 0U) {
             result.rows_compared++;
             if (row_equal) {
                 result.rows_equal++;
@@ -410,19 +452,21 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
     if (handle->config.analyze_walking_1 &&
         handle->stats.walking_analysis_frames > 0U) {
         ESP_LOGI(TAG,
-                 "Walking-1 observe rows_equal=%" PRIu32 "/%" PRIu32
-                 " vertical_mismatch=%" PRIu32
-                 " transitions=%" PRIu32 " unique=%" PRIu32
-                 " values(zero=%" PRIu32 ",one_hot=%" PRIu32
+                 "Walking-1 observe sampled_rows=%" PRIu32
+                 " equal=%" PRIu32 "/%" PRIu32
+                 " sampled_vertical_mismatch=%" PRIu32
+                 " transitions=%" PRIu32 " sampled_unique=%" PRIu32
+                 " sampled_values(zero=%" PRIu32 ",one_hot=%" PRIu32
                  ",other=%" PRIu32 ")",
-                 handle->stats.walking_rows_equal,
-                 handle->stats.walking_rows_compared,
-                 handle->stats.walking_vertical_mismatches,
+                 handle->stats.walking_sampled_rows,
+                 handle->stats.walking_sampled_rows_equal,
+                 handle->stats.walking_sampled_rows_compared,
+                 handle->stats.walking_sampled_vertical_mismatches,
                  handle->stats.walking_horizontal_transitions,
-                 handle->stats.walking_unique_values,
-                 handle->stats.walking_zero_values,
-                 handle->stats.walking_one_hot_values,
-                 handle->stats.walking_other_values);
+                 handle->stats.walking_sampled_unique_values,
+                 handle->stats.walking_sampled_zero_values,
+                 handle->stats.walking_sampled_one_hot_values,
+                 handle->stats.walking_sampled_other_values);
     }
     ESP_LOGI(TAG,
              "no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
@@ -512,16 +556,20 @@ static void hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
                 handle->config.active_x, handle->config.active_y,
                 handle->config.active_width, handle->config.active_height);
         handle->stats.walking_analysis_frames++;
-        handle->stats.walking_rows_equal = analysis.rows_equal;
-        handle->stats.walking_rows_compared = analysis.rows_compared;
-        handle->stats.walking_vertical_mismatches =
+        handle->stats.walking_sampled_rows = analysis.sampled_rows;
+        handle->stats.walking_sampled_rows_equal = analysis.rows_equal;
+        handle->stats.walking_sampled_rows_compared =
+            analysis.rows_compared;
+        handle->stats.walking_sampled_vertical_mismatches =
             analysis.vertical_mismatches;
         handle->stats.walking_horizontal_transitions =
             analysis.horizontal_transitions;
-        handle->stats.walking_unique_values = analysis.unique_values;
-        handle->stats.walking_zero_values = analysis.zero_values;
-        handle->stats.walking_one_hot_values = analysis.one_hot_values;
-        handle->stats.walking_other_values = analysis.other_values;
+        handle->stats.walking_sampled_unique_values =
+            analysis.unique_values;
+        handle->stats.walking_sampled_zero_values = analysis.zero_values;
+        handle->stats.walking_sampled_one_hot_values =
+            analysis.one_hot_values;
+        handle->stats.walking_sampled_other_values = analysis.other_values;
     }
 
 finish:
@@ -553,16 +601,12 @@ static void hm01b0_capture_take_analysis_sample(
             ? handle->config.active_width
             : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
     sample->active_x = handle->config.active_x;
-    sample->active_rows[0] = handle->config.active_y;
-    sample->active_rows[1] =
-        (uint16_t)(handle->config.active_y +
-                   handle->config.active_height / 2U);
-    sample->active_rows[2] =
-        (uint16_t)(handle->config.active_y +
-                   handle->config.active_height - 1U);
+    sample->active_row_count = hm01b0_select_walking_sample_rows(
+        handle->config.active_y, handle->config.active_height,
+        sample->active_rows);
 
     memcpy(sample->raw, frame->data, sample->raw_sample_size);
-    for (size_t i = 0; i < 3U; ++i) {
+    for (size_t i = 0; i < sample->active_row_count; ++i) {
         const size_t offset = (size_t)sample->active_rows[i] *
                                   handle->config.raw_width +
                               handle->config.active_x;
@@ -587,7 +631,7 @@ static void hm01b0_capture_log_first_analysis(
     ESP_LOG_BUFFER_HEX_LEVEL(TAG, sample->raw, sample->raw_sample_size,
                              ESP_LOG_INFO);
 
-    for (size_t i = 0; i < 3U; ++i) {
+    for (size_t i = 0; i < sample->active_row_count; ++i) {
         ESP_LOGI(TAG, "active row y=%u x=%u..%u",
                  (unsigned)sample->active_rows[i],
                  (unsigned)sample->active_x,

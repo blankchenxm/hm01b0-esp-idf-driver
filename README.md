@@ -56,7 +56,7 @@ transport frame and performs no crop:
 | Buffer allocation | Driver-aligned length from `esp_cam_ctlr_get_frame_buffer_len()` |
 | Backup buffer | Disabled |
 | DMA burst | 64 bytes |
-| Analysis | Exact received length, raw/active CRC32, Walking-1 row/value statistics, FPS, queue errors, maximum processing time |
+| Analysis | Exact received length, raw/active CRC32, four-row Walking-1 sampling, FPS, queue errors, maximum processing time |
 | Warm-up | Skip five startup frames before content baselines |
 
 The frame descriptor keeps the 79,056-byte payload size, aligned buffer
@@ -181,7 +181,7 @@ PASS: HM01B0 initialized in STANDBY
 ```
 
 Stage 3 then reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
-addresses, internal DMA heap usage, raw/active CRCs, compact samples from three
+addresses, internal DMA heap usage, raw/active CRCs, compact samples from four
 active rows, and one summary per second. It never prints a complete frame.
 Hardware acceptance requires at least 60 seconds near 30 FPS with no size,
 starvation, or queue errors; Walking-1 is observed structurally until its exact
