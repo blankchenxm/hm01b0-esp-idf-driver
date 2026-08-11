@@ -1,11 +1,11 @@
 #include <inttypes.h>
+#include <stdatomic.h>
 
 #include "app_config.h"
 #include "board_config.h"
 #include "driver/i2c_types.h"
 #include "driver/spi_master.h"
 #include "esp_err.h"
-#include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -14,7 +14,7 @@
 #include "hm01b0_capture.h"
 #include "st7789_display.h"
 
-static const char *TAG = "hm01b0_stage4_5";
+static const char *TAG = "hm01b0_stage5";
 
 static hm01b0_handle_t *s_sensor;
 static hm01b0_capture_handle_t *s_capture;
@@ -22,6 +22,11 @@ static st7789_display_handle_t *s_display;
 static uint8_t *s_snapshot;
 static TaskHandle_t s_app_task;
 static hm01b0_snapshot_result_t s_snapshot_result;
+static atomic_bool s_live_warmup_complete;
+static int64_t s_last_display_error_log_us;
+static uint16_t s_live_source_width;
+static uint16_t s_live_source_height;
+static size_t s_live_source_stride;
 
 static void hm01b0_snapshot_ready(
     const hm01b0_snapshot_result_t *result,
@@ -39,6 +44,73 @@ static hm01b0_frame_rect_t hm01b0_to_frame_rect(hm01b0_rect_t rect)
         .width = rect.width,
         .height = rect.height,
     };
+}
+
+static void hm01b0_live_frame_ready(
+    const hm01b0_capture_frame_t *frame,
+    void *user_data)
+{
+    st7789_display_handle_t *display = user_data;
+    if (frame->sequence <= APP_STREAM_WARMUP_FRAMES) {
+        return;
+    }
+    if (!atomic_exchange(&s_live_warmup_complete, true)) {
+        st7789_display_reset_stats(display);
+        ESP_LOGI(TAG,
+                 "real-image warm-up complete: skipped %u frames before "
+                 "display",
+                 (unsigned)APP_STREAM_WARMUP_FRAMES);
+    }
+
+    const esp_err_t ret = st7789_display_try_draw_gray8_frame(
+        display,
+        frame->data,
+        s_live_source_width,
+        s_live_source_height,
+        s_live_source_stride,
+        APP_DISPLAY_CROP_X,
+        APP_DISPLAY_CROP_Y);
+    if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (s_last_display_error_log_us == 0 ||
+        now_us - s_last_display_error_log_us >= 1000000LL) {
+        s_last_display_error_log_us = now_us;
+        ESP_LOGE(TAG, "real-image display submission failed: %s",
+                 esp_err_to_name(ret));
+    }
+}
+
+static void hm01b0_log_live_display_stats(void)
+{
+    st7789_display_stats_t stats = {0};
+    const esp_err_t ret = st7789_display_get_stats(s_display, &stats);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to read display statistics: %s",
+                 esp_err_to_name(ret));
+        return;
+    }
+
+    ESP_LOGI(TAG,
+             "display_fps=%" PRIu32 ".%03" PRIu32
+             " submitted=%" PRIu32 " completed=%" PRIu32
+             " dropped_busy=%" PRIu32 " submit_err=%" PRIu32
+             " rgb_busy=%u",
+             stats.fps_milli / 1000U, stats.fps_milli % 1000U,
+             stats.submitted_frames, stats.completed_frames,
+             stats.dropped_busy, stats.submit_errors,
+             stats.busy ? 1U : 0U);
+    ESP_LOGI(TAG,
+             "display timing: convert(last=%" PRIu32 "us,max=%" PRIu32
+             "us) submit(last=%" PRIu32 "us,max=%" PRIu32
+             "us) dma(last=%" PRIu32 "us,max=%" PRIu32
+             "us) rgb_buffer=%u bytes",
+             stats.last_convert_time_us, stats.max_convert_time_us,
+             stats.last_submit_time_us, stats.max_submit_time_us,
+             stats.last_dma_time_us, stats.max_dma_time_us,
+             (unsigned)stats.frame_buffer_size);
 }
 
 static void hm01b0_log_preflight_result(
@@ -112,13 +184,12 @@ static esp_err_t hm01b0_run_preflight(
 
     const hm01b0_snapshot_request_t snapshot_request = {
         .buffer = s_snapshot,
-        .buffer_size = APP_PREFLIGHT_SNAPSHOT_WIDTH *
-                       APP_PREFLIGHT_SNAPSHOT_HEIGHT,
+        .buffer_size = APP_DISPLAY_CROP_WIDTH * APP_DISPLAY_CROP_HEIGHT,
         .crop = {
-            .x = APP_PREFLIGHT_SNAPSHOT_X,
-            .y = APP_PREFLIGHT_SNAPSHOT_Y,
-            .width = APP_PREFLIGHT_SNAPSHOT_WIDTH,
-            .height = APP_PREFLIGHT_SNAPSHOT_HEIGHT,
+            .x = APP_DISPLAY_CROP_X,
+            .y = APP_DISPLAY_CROP_Y,
+            .width = APP_DISPLAY_CROP_WIDTH,
+            .height = APP_DISPLAY_CROP_HEIGHT,
         },
         .skip_frames = APP_PREFLIGHT_WARMUP_FRAMES,
         .on_ready = hm01b0_snapshot_ready,
@@ -160,8 +231,8 @@ static esp_err_t hm01b0_run_preflight(
     const int64_t display_start_us = esp_timer_get_time();
     ret = st7789_display_draw_gray8(
         s_display, 0U, 0U,
-        APP_PREFLIGHT_SNAPSHOT_WIDTH,
-        APP_PREFLIGHT_SNAPSHOT_HEIGHT,
+        APP_DISPLAY_CROP_WIDTH,
+        APP_DISPLAY_CROP_HEIGHT,
         s_snapshot);
     if (ret != ESP_OK) {
         (void)hm01b0_stream_stop(s_sensor);
@@ -224,11 +295,14 @@ static void hm01b0_cleanup(void)
         (void)hm01b0_set_test_pattern(s_sensor, HM01B0_TEST_PATTERN_OFF);
     }
     (void)hm01b0_capture_rx_stop(s_capture);
+    if (s_capture != NULL) {
+        (void)hm01b0_capture_set_frame_consumer(s_capture, NULL, NULL);
+    }
+    (void)st7789_display_wait_idle(s_display, 1000U);
     (void)hm01b0_capture_delete(s_capture);
     s_capture = NULL;
     (void)st7789_display_delete(s_display);
     s_display = NULL;
-    heap_caps_free(s_snapshot);
     s_snapshot = NULL;
     (void)hm01b0_delete(s_sensor);
     s_sensor = NULL;
@@ -237,8 +311,8 @@ static void hm01b0_cleanup(void)
 void app_main(void)
 {
     s_app_task = xTaskGetCurrentTaskHandle();
-    ESP_LOGI(TAG, "Stage 4.5 startup: initialize, preflight both patterns, "
-                  "then disable test output");
+    ESP_LOGI(TAG, "Stage 5 startup: initialize, preflight both patterns, "
+                  "then stream real QVGA images to ST7789");
     ESP_LOGI(TAG, "Control pins: MCLK=%d SDA=%d SCL=%d",
              BOARD_HM01B0_MCLK_GPIO,
              BOARD_HM01B0_I2C_SDA_GPIO,
@@ -257,6 +331,18 @@ void app_main(void)
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to obtain sensor mode geometry: %s",
                  esp_err_to_name(ret));
+        return;
+    }
+    if (APP_DISPLAY_CROP_WIDTH != APP_ST7789_WIDTH ||
+        APP_DISPLAY_CROP_HEIGHT != APP_ST7789_HEIGHT ||
+        APP_DISPLAY_CROP_X >= mode_info.transport_width ||
+        APP_DISPLAY_CROP_Y >= mode_info.transport_height ||
+        APP_DISPLAY_CROP_WIDTH >
+            mode_info.transport_width - APP_DISPLAY_CROP_X ||
+        APP_DISPLAY_CROP_HEIGHT >
+            mode_info.transport_height - APP_DISPLAY_CROP_Y) {
+        ESP_LOGE(TAG, "display crop is incompatible with sensor/display "
+                      "geometry");
         return;
     }
 
@@ -289,17 +375,6 @@ void app_main(void)
     }
     ESP_LOGI(TAG, "HM01B0 ready in STANDBY, MODEL_ID=0x%04X", model_id);
 
-    const size_t snapshot_size =
-        APP_PREFLIGHT_SNAPSHOT_WIDTH * APP_PREFLIGHT_SNAPSHOT_HEIGHT;
-    s_snapshot = heap_caps_malloc(snapshot_size,
-                                  MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
-    if (s_snapshot == NULL) {
-        ret = ESP_ERR_NO_MEM;
-        ESP_LOGE(TAG, "failed to allocate %u-byte preflight snapshot",
-                 (unsigned)snapshot_size);
-        goto fail;
-    }
-
     const st7789_display_config_t display_config = {
         .spi_host = SPI2_HOST,
         .clock_gpio = BOARD_ST7789_SCLK_GPIO,
@@ -313,6 +388,18 @@ void app_main(void)
     };
     ret = st7789_display_new(&display_config, &s_display);
     if (ret != ESP_OK) {
+        goto fail;
+    }
+    size_t snapshot_size = 0U;
+    ret = st7789_display_get_preflight_buffer(
+        s_display, &s_snapshot, &snapshot_size);
+    if (ret != ESP_OK ||
+        snapshot_size < APP_DISPLAY_CROP_WIDTH * APP_DISPLAY_CROP_HEIGHT) {
+        if (ret == ESP_OK) {
+            ret = ESP_ERR_INVALID_SIZE;
+        }
+        ESP_LOGE(TAG, "failed to borrow preflight snapshot workspace: %s",
+                 esp_err_to_name(ret));
         goto fail;
     }
 
@@ -364,16 +451,60 @@ void app_main(void)
         goto fail;
     }
     (void)hm01b0_capture_set_diagnostics(s_capture, NULL);
+
+    s_snapshot = NULL;
+    ret = st7789_display_prepare_stream(s_display);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to prepare RGB565 stream buffer: %s",
+                 esp_err_to_name(ret));
+        goto fail;
+    }
+    s_live_source_width = mode_info.transport_width;
+    s_live_source_height = mode_info.transport_height;
+    s_live_source_stride = mode_info.transport_width;
+    ret = hm01b0_capture_set_frame_consumer(
+        s_capture, hm01b0_live_frame_ready, s_display);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to configure live frame consumer: %s",
+                 esp_err_to_name(ret));
+        goto fail;
+    }
+
+    atomic_store(&s_live_warmup_complete,
+                 APP_STREAM_WARMUP_FRAMES == 0U);
+    s_last_display_error_log_us = 0;
+    ret = hm01b0_capture_rx_start(s_capture);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start Camera RX for real images: %s",
+                 esp_err_to_name(ret));
+        goto fail;
+    }
+    ret = hm01b0_stream_start(s_sensor);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to start HM01B0 real-image stream: %s",
+                 esp_err_to_name(ret));
+        (void)hm01b0_capture_rx_stop(s_capture);
+        goto fail;
+    }
     ESP_LOGI(TAG,
-             "Stage 4.5 complete: both preflights finished; HM01B0 is in "
-             "STANDBY, Camera RX is stopped, test pattern is OFF. Real-image "
-             "streaming is reserved for Stage 5.");
+             "Stage 5 running: test pattern OFF, HM01B0 QVGA RAW8 324x244 "
+             "streaming; display crop=(%u,%u %ux%u), ST7789=%ux%u "
+             "RGB565 over esp_lcd SPI DMA",
+             (unsigned)APP_DISPLAY_CROP_X,
+             (unsigned)APP_DISPLAY_CROP_Y,
+             (unsigned)APP_DISPLAY_CROP_WIDTH,
+             (unsigned)APP_DISPLAY_CROP_HEIGHT,
+             (unsigned)APP_ST7789_WIDTH,
+             (unsigned)APP_ST7789_HEIGHT);
 
     while (true) {
-        vTaskDelay(pdMS_TO_TICKS(1000U));
+        vTaskDelay(pdMS_TO_TICKS(APP_STREAM_STATS_PERIOD_MS));
+        if (atomic_load(&s_live_warmup_complete)) {
+            hm01b0_log_live_display_stats();
+        }
     }
 
 fail:
     hm01b0_cleanup();
-    ESP_LOGE(TAG, "Stage 4.5 stopped: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Stage 5 stopped: %s", esp_err_to_name(ret));
 }

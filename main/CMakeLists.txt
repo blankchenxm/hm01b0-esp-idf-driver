@@ -6,5 +6,4 @@ idf_component_register(
         hm01b0_capture
         st7789_display
         esp_timer
-        heap
 )
