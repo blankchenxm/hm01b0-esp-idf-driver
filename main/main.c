@@ -143,13 +143,48 @@ static esp_err_t hm01b0_run_preflight(
 
     const uint32_t notification = ulTaskNotifyTake(
         pdTRUE, pdMS_TO_TICKS(APP_PREFLIGHT_CAPTURE_TIMEOUT_MS));
+    if (notification == 0U) {
+        ESP_LOGE(TAG, "%s preflight timed out waiting for snapshot", name);
+        (void)hm01b0_stream_stop(s_sensor);
+        (void)hm01b0_capture_rx_stop(s_capture);
+        return ESP_ERR_TIMEOUT;
+    }
+
+    ret = hm01b0_capture_get_snapshot_result(s_capture, &s_snapshot_result);
+    if (ret != ESP_OK) {
+        (void)hm01b0_stream_stop(s_sensor);
+        (void)hm01b0_capture_rx_stop(s_capture);
+        return ret;
+    }
+
+    const int64_t display_start_us = esp_timer_get_time();
+    ret = st7789_display_draw_gray8(
+        s_display, 0U, 0U,
+        APP_PREFLIGHT_SNAPSHOT_WIDTH,
+        APP_PREFLIGHT_SNAPSHOT_HEIGHT,
+        s_snapshot);
+    if (ret != ESP_OK) {
+        (void)hm01b0_stream_stop(s_sensor);
+        (void)hm01b0_capture_rx_stop(s_capture);
+        return ret;
+    }
+    const uint32_t display_time_us = (uint32_t)(
+        esp_timer_get_time() - display_start_us);
+    ESP_LOGI(TAG,
+             "%s displayed: source_frame=%" PRIu32
+             " snapshot=%u bytes copy=%" PRIu32 "us hold=%" PRIu32
+             "us display=%" PRIu32 "us; holding for %u ms while Camera RX "
+             "and diagnostics continue",
+             name, s_snapshot_result.sequence,
+             (unsigned)s_snapshot_result.size,
+             s_snapshot_result.copy_time_us,
+             s_snapshot_result.buffer_hold_time_us,
+             display_time_us,
+             (unsigned)APP_PREFLIGHT_DISPLAY_TIME_MS);
+    vTaskDelay(pdMS_TO_TICKS(APP_PREFLIGHT_DISPLAY_TIME_MS));
 
     const esp_err_t sensor_stop_result = hm01b0_stream_stop(s_sensor);
     const esp_err_t rx_stop_result = hm01b0_capture_rx_stop(s_capture);
-    if (notification == 0U) {
-        ESP_LOGE(TAG, "%s preflight timed out waiting for snapshot", name);
-        return ESP_ERR_TIMEOUT;
-    }
     if (sensor_stop_result != ESP_OK) {
         return sensor_stop_result;
     }
@@ -167,10 +202,6 @@ static esp_err_t hm01b0_run_preflight(
     if (ret != ESP_OK) {
         return ret;
     }
-    ret = hm01b0_capture_get_snapshot_result(s_capture, &s_snapshot_result);
-    if (ret != ESP_OK) {
-        return ret;
-    }
 
     hm01b0_log_preflight_result(name, &transport, &diagnostic);
     const bool transport_pass =
@@ -182,29 +213,6 @@ static esp_err_t hm01b0_run_preflight(
     if (!transport_pass) {
         return ESP_FAIL;
     }
-
-    const int64_t display_start_us = esp_timer_get_time();
-    ret = st7789_display_draw_gray8(
-        s_display, 0U, 0U,
-        APP_PREFLIGHT_SNAPSHOT_WIDTH,
-        APP_PREFLIGHT_SNAPSHOT_HEIGHT,
-        s_snapshot);
-    if (ret != ESP_OK) {
-        return ret;
-    }
-    const uint32_t display_time_us = (uint32_t)(
-        esp_timer_get_time() - display_start_us);
-    ESP_LOGI(TAG,
-             "%s displayed: source_frame=%" PRIu32
-             " snapshot=%u bytes copy=%" PRIu32 "us hold=%" PRIu32
-             "us display=%" PRIu32 "us; holding for %u ms",
-             name, s_snapshot_result.sequence,
-             (unsigned)s_snapshot_result.size,
-             s_snapshot_result.copy_time_us,
-             s_snapshot_result.buffer_hold_time_us,
-             display_time_us,
-             (unsigned)APP_PREFLIGHT_DISPLAY_TIME_MS);
-    vTaskDelay(pdMS_TO_TICKS(APP_PREFLIGHT_DISPLAY_TIME_MS));
     ESP_LOGI(TAG, "preflight complete: %s", name);
     return ESP_OK;
 }

@@ -7,8 +7,9 @@ The repository currently contains the completed sensor-control foundation:
 external MCLK generation, 16-bit-address/8-bit-data I2C access, model-ID probe,
 register tables, operating modes, interface configuration, test patterns, and a
 standby/streaming state machine. It also contains direct ESP32-S3 DVP capture
-with two internal DMA frame buffers. Stage 4 adds a one-shot 240 x 240 grayscale
-snapshot on an SPI ST7789 while Camera RX continues running.
+with two internal DMA frame buffers. Stage 4.5 separates transport, diagnostics,
+frame operations, and display responsibilities and adds a two-pattern startup
+preflight before real-image streaming is introduced.
 
 ## Current status
 
@@ -17,12 +18,16 @@ snapshot on an SPI ST7789 while Camera RX continues running.
 | 1. MCLK + I2C | Complete | 12 MHz MCLK, I2C register access, `MODEL_ID=0x01B0` probe |
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
 | 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and selectable test-pattern observation |
-| 4. Static ST7789 display | Implemented, Color-Bar validation pending | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
+| 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
+| 4.5. Pre-streaming architecture | Implemented, build/hardware validation pending | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
 
-The current sample application initializes the sensor and ST7789, prepares the
-receiver and buffers, starts Camera RX, and only then starts HM01B0 streaming.
-It validates raw frames over serial logs, copies one post-warm-up crop to an
-application snapshot, and displays that snapshot once without stopping capture.
+The current sample initializes the sensor, capture controller, two DMA buffers,
+snapshot buffer, and ST7789. It then runs Walking-1 and Color-Bar preflights in
+sequence. Each preflight starts Camera RX before sensor streaming, skips five
+frames, analyzes and snapshots one complete frame, and displays the static crop
+for three seconds while capture diagnostics continue. It then stops the sensor
+and Camera RX. The application finally disables the
+sensor test pattern and remains in standby; real-image streaming is Stage 5.
 
 ## Initial sensor configuration
 
@@ -31,7 +36,7 @@ application snapshot, and displays that snapshot once without stopping capture.
 | Sensor mode | QVGA |
 | Pixel output | RAW8 |
 | Data interface | 8-bit parallel |
-| Test pattern | Color Bar (current sample; Walking-1 also supported) |
+| Initial/final test pattern | Off; Walking-1 and Color-Bar are enabled only during startup preflight |
 | Operation | Non-SYNC |
 | PCLK | Non-gated, rising edge |
 | MCLK | 12 MHz external clock |
@@ -57,7 +62,8 @@ transport frame and performs no crop:
 | Buffer allocation | Driver-aligned length from `esp_cam_ctlr_get_frame_buffer_len()` |
 | Backup buffer | Disabled |
 | DMA burst | 64 bytes |
-| Analysis | Exact received length, raw/active CRC32, selectable four-row Walking-1 or Color-Bar observation, FPS, queue errors, maximum processing time |
+| Mandatory processing | Exact received length, sequence, queue/Buffer errors, FPS and timing |
+| Optional diagnostics | Raw/active CRC32 and selectable four-row Walking-1 or Color-Bar observation |
 | Warm-up | Skip five startup frames before content baselines |
 
 The frame descriptor keeps the 79,056-byte payload size, aligned buffer
@@ -74,11 +80,12 @@ first size-valid frame after warm-up, the frame task copies the centered crop
 It returns the Camera DMA buffer before notifying `app_main`, so the one-time
 SPI display transfer cannot hold Buffer A or B.
 
-The ST7789 uses SPI2 at 40 MHz. `st7789_draw_gray_image()` converts the packed
+The ST7789 uses SPI2 at 40 MHz. `st7789_display_draw_gray8()` converts the packed
 RAW8 snapshot to RGB565 in small chunks and writes the screen once. Camera RX
-and Stage 3 diagnostics continue afterward; ST7789 GRAM retains the static
-image. The detailed scope, ownership flow, expected logs, and hardware checks
-are recorded in [stage4_todo.md](stage4_todo.md).
+and optional diagnostics continue during the static hold, without owning either
+Camera Buffer; they are stopped before switching patterns. The detailed Stage 4 scope is
+recorded in [stage4_todo.md](stage4_todo.md), and the architecture decisions are
+recorded in [stage4_5_todo.md](stage4_5_todo.md).
 
 The capture component exposes mutually exclusive `NONE`, `WALKING_1`, and
 `COLOR_BAR` analysis modes. Color-Bar observation compares four representative
@@ -134,18 +141,26 @@ components/hm01b0/
   hm01b0.c                 Device creation, MCLK, I2C, initialization lifecycle
   hm01b0_reg.c             Low-level register read/write/update/table operations
   hm01b0_modes.c           Common, mode, interface, and test-pattern tables
+  hm01b0_mode_info.c       Full/QVGA/QQVGA transport and crop metadata
   hm01b0_sensor.c          Probe and sensor state-machine operations
 
 components/hm01b0_capture/
-  include/                 Capture lifecycle and statistics API
-  hm01b0_capture.c         DVP controller, DMA buffers, queues, callbacks,
-                           validation task, one-shot snapshot, and diagnostics
+  include/hm01b0_capture.h DVP lifecycle, transport stats, snapshot requests
+  include/hm01b0_diagnostics.h  Tagged optional Pattern reports
+  include/hm01b0_frame_ops.h    Generic RAW8 crop/copy operation
+  hm01b0_capture.c         DVP, DMA buffers, queues, callbacks, frame task
+  hm01b0_diagnostics.c     CRC, Walking-1 and Color-Bar observation
+  hm01b0_frame_ops.c       Allocation-free RAW8 rectangle copy
   hm01b0_cache_compat.c    ESP-IDF 6.0 internal-SRAM DVP cache workaround
+
+components/st7789_display/
+  include/                 Handle-based SPI display API
+  st7789_display.c         ST7789 initialization and RAW8-to-RGB565 transfer
 
 main/
   board_config.h           Sample board pin mapping
-  main.c                   Receiver-first capture and static-display application
-  st7789_display.c/.h      SPI ST7789 initialization and pixel transfer
+  app_config.h             Stage 4.5 experiment and preflight policy
+  main.c                   Initialize, run two preflights, disable test output
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
@@ -180,8 +195,10 @@ esp_err_t hm01b0_write_table(hm01b0_handle_t *dev,
 esp_err_t hm01b0_probe(hm01b0_handle_t *dev, uint16_t *model_id);
 esp_err_t hm01b0_reset(hm01b0_handle_t *dev);
 esp_err_t hm01b0_standby(hm01b0_handle_t *dev);
-esp_err_t hm01b0_start(hm01b0_handle_t *dev);
-esp_err_t hm01b0_stop(hm01b0_handle_t *dev);
+esp_err_t hm01b0_stream_start(hm01b0_handle_t *dev);
+esp_err_t hm01b0_stream_stop(hm01b0_handle_t *dev);
+esp_err_t hm01b0_get_mode_info(hm01b0_mode_t mode,
+                               hm01b0_mode_info_t *info);
 ```
 
 Mode, interface, test-pattern, state-query, and configuration APIs are declared
@@ -210,14 +227,12 @@ MODEL_ID_H=0x01, MODEL_ID_L=0xB0, MODEL_ID=0x01B0
 PASS: HM01B0 initialized in STANDBY
 ```
 
-Stage 3 reports the 324 x 244 geometry, aligned buffer capacity, Buffer A/B
-addresses, internal DMA heap usage, raw/active CRCs, compact samples from four
-active rows, selected test-pattern structure, and one summary per second. It
-never prints a complete frame.
-Stage 4 additionally reports the snapshot crop, copy/hold timing, source frame,
-and one-time LCD transfer duration. Hardware acceptance requires continued
-capture near 30 FPS with no size, starvation, or queue errors and a stable
-240 x 240 grayscale test-pattern image on the ST7789.
+Stage 4.5 reports the 324 x 244 geometry, aligned Buffer A/B allocations,
+transport health, tagged Pattern observations, snapshot copy/hold timing, and
+one-time LCD transfer duration for each preflight. It never prints a complete
+frame. Hardware acceptance requires both static patterns to display, zero size
+or queue/Buffer errors, test pattern OFF at the end, sensor standby, and Camera
+RX stopped.
 
 Board-specific `sdkconfig` files and local editor/tool paths are intentionally
 not committed.

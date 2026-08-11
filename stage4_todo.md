@@ -72,8 +72,8 @@ static image remains on the LCD.
 - [x] Build, flash, and visually validate the Walking-1 static image.
 - [x] Preserve Walking-1 analysis and add selectable Color-Bar analysis.
 - [x] Select Color-Bar while retaining the same snapshot/display path.
-- [ ] Build and flash the Color-Bar update in the owner's ESP-IDF 6.0 environment.
-- [ ] Visually validate the Color-Bar grayscale bands.
+- [x] Build and flash the Color-Bar update in the owner's ESP-IDF 6.0 environment.
+- [x] Visually validate the Color-Bar grayscale bands.
 
 ## Expected serial evidence
 

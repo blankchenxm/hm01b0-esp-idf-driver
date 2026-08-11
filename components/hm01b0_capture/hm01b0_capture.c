@@ -565,7 +565,9 @@ static void hm01b0_capture_task(void *arg)
         if (hold_time_us > handle->transport.max_buffer_hold_time_us) {
             handle->transport.max_buffer_hold_time_us = hold_time_us;
         }
-        handle->snapshot_result.buffer_hold_time_us = hold_time_us;
+        if (snapshot_ready) {
+            handle->snapshot_result.buffer_hold_time_us = hold_time_us;
+        }
         handle->processing_frame = false;
 
         if (snapshot_ready && frame_returned) {
