@@ -94,9 +94,32 @@ The reported `dma` interval starts immediately before
 callback. It therefore includes the measured draw-call interval and must not be
 added to `submit` when calculating end-to-end latency.
 
+## FPS experiment 1: 80 MHz SPI and RGB565 lookup
+
+Tracked separately by GitHub Issue #9 so the hardware-validated 40 MHz commit
+remains an exact rollback point.
+
+- [x] Request an 80 MHz ST7789 SPI clock instead of 40 MHz.
+- [x] Precompute all 256 RAW8 grayscale-to-RGB565 mappings during display
+  initialization.
+- [x] Store lookup words in the byte order that reproduces the validated
+  MSB-first ST7789 stream on the little-endian ESP32-S3.
+- [x] Replace repeated per-pixel shifts and masks with one lookup and one
+  16-bit destination write.
+- [x] Use the same lookup conversion for preflight lines and live frames.
+- [ ] Build and flash in the owner's ESP-IDF 6.0 environment.
+- [ ] Confirm Walking-1, Color-Bar, and real images remain visually correct at
+  80 MHz.
+- [ ] Compare conversion, draw-call, completion, processing, and Buffer-hold
+  maxima against the validated 40 MHz baseline.
+- [ ] Confirm all Camera and display error counters remain zero.
+
+This first experiment deliberately leaves the HM01B0 at approximately 30 FPS.
+It measures display-path headroom before changing sensor frame timing.
+
 ## Deferred
 
-- [ ] 60 FPS sensor timing and higher SPI clock experiments.
+- [ ] Higher HM01B0 sensor frame timing after the 80 MHz display experiment.
 - [ ] TE/vertical-blank synchronization and tearing control.
 - [ ] Full 320-to-240 horizontal downscaling.
 - [ ] A second complete RGB565 Buffer.

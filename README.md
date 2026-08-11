@@ -93,8 +93,11 @@ first size-valid frame after warm-up, the frame task copies the centered crop
 It returns the Camera DMA buffer before notifying `app_main`, so the one-time
 SPI display transfer cannot hold Buffer A or B.
 
-The ST7789 uses SPI2 at 40 MHz through ESP-IDF `esp_lcd` and its asynchronous SPI
-DMA completion callback. `st7789_display_draw_gray8()` converts the packed
+The validated Stage 5 baseline uses SPI2 at 40 MHz through ESP-IDF `esp_lcd`
+and its asynchronous SPI DMA completion callback. The current Issue #9
+performance experiment requests 80 MHz and replaces per-pixel RGB565 bit
+operations with a precomputed 256-entry lookup table.
+`st7789_display_draw_gray8()` converts the packed
 RAW8 preflight snapshot to RGB565 lines and writes the screen once. Camera RX
 and optional diagnostics continue during the static hold, without owning either
 Camera Buffer; they are stopped before switching patterns. The detailed Stage 4 scope is
