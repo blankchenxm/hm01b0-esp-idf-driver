@@ -35,11 +35,11 @@ esp_err_t hm01b0_reset(hm01b0_handle_t *dev);
 /** Enter software standby. Configuration changes are allowed in this state. */
 esp_err_t hm01b0_standby(hm01b0_handle_t *dev);
 
-/** Start continuous I2C-triggered streaming from the standby state. */
-esp_err_t hm01b0_start(hm01b0_handle_t *dev);
+/** Start sensor pixel streaming from the standby state. */
+esp_err_t hm01b0_stream_start(hm01b0_handle_t *dev);
 
-/** Stop continuous streaming and return to software standby. */
-esp_err_t hm01b0_stop(hm01b0_handle_t *dev);
+/** Stop sensor pixel streaming and return to software standby. */
+esp_err_t hm01b0_stream_stop(hm01b0_handle_t *dev);
 
 /** Apply one of the Full/QVGA/QQVGA mode tables while in standby. */
 esp_err_t hm01b0_set_mode(hm01b0_handle_t *dev, hm01b0_mode_t mode);
@@ -51,6 +51,10 @@ esp_err_t hm01b0_set_interface(hm01b0_handle_t *dev,
 /** Select test-pattern off, color bar, or walking-1 while in standby. */
 esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
                                   hm01b0_test_pattern_t pattern);
+
+/** Return the transport and crop geometry associated with a sensor mode. */
+esp_err_t hm01b0_get_mode_info(hm01b0_mode_t mode,
+                               hm01b0_mode_info_t *info);
 
 /** Return the driver's current state without accessing the sensor bus. */
 hm01b0_state_t hm01b0_get_state(const hm01b0_handle_t *dev);

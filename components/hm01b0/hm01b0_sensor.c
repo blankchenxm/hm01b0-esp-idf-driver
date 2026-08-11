@@ -79,7 +79,7 @@ esp_err_t hm01b0_standby(hm01b0_handle_t *dev)
     return ESP_OK;
 }
 
-esp_err_t hm01b0_start(hm01b0_handle_t *dev)
+esp_err_t hm01b0_stream_start(hm01b0_handle_t *dev)
 {
     ESP_RETURN_ON_ERROR(hm01b0_require_standby(dev), TAG,
                         "cannot start streaming");
@@ -94,7 +94,7 @@ esp_err_t hm01b0_start(hm01b0_handle_t *dev)
     return ESP_OK;
 }
 
-esp_err_t hm01b0_stop(hm01b0_handle_t *dev)
+esp_err_t hm01b0_stream_stop(hm01b0_handle_t *dev)
 {
     ESP_RETURN_ON_FALSE(dev != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "device handle is NULL");

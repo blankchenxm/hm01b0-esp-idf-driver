@@ -30,4 +30,11 @@
 #define BOARD_HM01B0_D6_GPIO       GPIO_NUM_15
 #define BOARD_HM01B0_D7_GPIO       GPIO_NUM_16
 
+/* SPI ST7789 wiring used only by the sample application. */
+#define BOARD_ST7789_SCLK_GPIO      GPIO_NUM_35
+#define BOARD_ST7789_MOSI_GPIO      GPIO_NUM_36
+#define BOARD_ST7789_RESET_GPIO     GPIO_NUM_37
+#define BOARD_ST7789_DC_GPIO        GPIO_NUM_38
+#define BOARD_ST7789_CS_GPIO        GPIO_NUM_39
+
 #endif /* BOARD_CONFIG_H */

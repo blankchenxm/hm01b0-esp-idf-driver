@@ -193,7 +193,7 @@ esp_err_t hm01b0_delete(hm01b0_handle_t *dev)
 
     esp_err_t result = ESP_OK;
     if (dev->state == HM01B0_STATE_STREAMING) {
-        result = hm01b0_stop(dev);
+        result = hm01b0_stream_stop(dev);
     }
     if (dev->i2c_device != NULL) {
         const esp_err_t ret = i2c_master_bus_rm_device(dev->i2c_device);

@@ -7,7 +7,6 @@
 #include "esp_cam_ctlr.h"
 #include "esp_cam_ctlr_dvp.h"
 #include "esp_check.h"
-#include "esp_crc.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
 #include "esp_memory_utils.h"
@@ -17,64 +16,12 @@
 #include "freertos/task.h"
 #include "hm01b0_capture.h"
 
-#define HM01B0_CAPTURE_DEFAULT_TASK_STACK_SIZE 4096U
-#define HM01B0_CAPTURE_DEFAULT_TASK_PRIORITY   5U
-#define HM01B0_CAPTURE_DEFAULT_STATS_PERIOD_MS 1000U
-#define HM01B0_CAPTURE_DEFAULT_WARMUP_FRAMES   5U
-#define HM01B0_CAPTURE_FIRST_SAMPLE_SIZE       32U
-#define HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS     4U
-#define HM01B0_CAPTURE_COLOR_BAR_STRONG_DELTA  8U
-#define HM01B0_CAPTURE_QUEUE_WAIT_MS           100U
-#define HM01B0_CAPTURE_TASK_STOP_TIMEOUT_MS    500U
-
-typedef struct {
-    uint8_t *data;
-    size_t received_size;
-    uint32_t sequence;
-} hm01b0_capture_frame_t;
-
-typedef struct {
-    uint32_t sampled_rows;
-    uint32_t rows_equal;
-    uint32_t rows_compared;
-    uint32_t vertical_mismatches;
-    uint32_t horizontal_transitions;
-    uint32_t unique_values;
-    uint32_t zero_values;
-    uint32_t one_hot_values;
-    uint32_t other_values;
-} hm01b0_walking_analysis_t;
-
-typedef struct {
-    uint32_t sampled_rows;
-    uint32_t rows_equal;
-    uint32_t rows_compared;
-    uint32_t vertical_mismatches;
-    uint32_t horizontal_transitions;
-    uint32_t strong_transitions;
-    uint32_t unique_values;
-    uint32_t center_changes;
-    uint32_t center_vertical_mismatches;
-    uint8_t min_value;
-    uint8_t max_value;
-    uint8_t center_values[HM01B0_CAPTURE_COLOR_BAR_COUNT];
-} hm01b0_color_bar_analysis_t;
-
-typedef struct {
-    uint32_t sequence;
-    uint32_t warmup_frames;
-    size_t received_size;
-    uint32_t raw_crc;
-    uint32_t active_crc;
-    size_t raw_sample_size;
-    size_t active_sample_size;
-    uint16_t active_x;
-    size_t active_row_count;
-    uint16_t active_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS];
-    uint8_t raw[HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
-    uint8_t active[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS]
-                  [HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
-} hm01b0_analysis_sample_t;
+#define HM01B0_CAPTURE_TASK_STACK_SIZE      4096U
+#define HM01B0_CAPTURE_TASK_PRIORITY        5U
+#define HM01B0_CAPTURE_STATS_PERIOD_MS      1000U
+#define HM01B0_CAPTURE_FIRST_SAMPLE_SIZE    32U
+#define HM01B0_CAPTURE_QUEUE_WAIT_MS        100U
+#define HM01B0_CAPTURE_TASK_STOP_TIMEOUT_MS 500U
 
 struct hm01b0_capture {
     hm01b0_capture_config_t config;
@@ -102,20 +49,26 @@ struct hm01b0_capture {
     volatile uint32_t isr_ready_queue_overflows;
     volatile uint32_t isr_free_queue_errors;
     uint32_t task_free_queue_errors;
-    hm01b0_capture_stats_t stats;
-
-    bool baseline_crc_valid;
-    uint32_t baseline_raw_crc;
-    uint32_t baseline_active_crc;
-    bool previous_active_crc_valid;
-    uint32_t previous_active_crc;
+    uint32_t processed_frames;
     bool baseline_received_size_valid;
     size_t baseline_received_size;
-    uint32_t processed_frames;
-    bool first_analysis_logged;
+
+    hm01b0_capture_transport_stats_t transport;
+    hm01b0_diagnostic_config_t diagnostic_config;
+    hm01b0_diagnostic_report_t diagnostic_report;
+    bool diagnostic_enabled;
+    bool diagnostic_baseline_valid;
+    uint32_t diagnostic_baseline_raw_crc;
+    uint32_t diagnostic_baseline_active_crc;
+    bool first_diagnostic_logged;
+
+    hm01b0_snapshot_request_t snapshot_request;
+    hm01b0_snapshot_result_t snapshot_result;
+    bool snapshot_pending;
+
     int64_t last_stats_time_us;
-    int64_t last_error_log_time_us;
     uint32_t last_stats_frame_count;
+    int64_t last_error_log_time_us;
 
     size_t dma_heap_free_before;
     size_t dma_heap_largest_before;
@@ -124,21 +77,6 @@ struct hm01b0_capture {
 };
 
 static const char *TAG = "hm01b0_capture";
-
-static const char *hm01b0_capture_pattern_analysis_name(
-    hm01b0_capture_pattern_analysis_t analysis)
-{
-    switch (analysis) {
-    case HM01B0_CAPTURE_PATTERN_ANALYSIS_NONE:
-        return "none";
-    case HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1:
-        return "Walking-1";
-    case HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR:
-        return "Color-Bar";
-    default:
-        return "invalid";
-    }
-}
 
 static bool IRAM_ATTR hm01b0_capture_on_get_new_trans(
     esp_cam_ctlr_handle_t cam_handle,
@@ -150,55 +88,6 @@ static bool IRAM_ATTR hm01b0_capture_on_trans_finished(
     void *user_data);
 static void hm01b0_capture_task(void *arg);
 
-static esp_err_t hm01b0_capture_reset_queues(
-    hm01b0_capture_handle_t *handle)
-{
-    xQueueReset(handle->free_queue);
-    xQueueReset(handle->ready_queue);
-    for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
-        hm01b0_capture_frame_t *frame = &handle->frames[i];
-        frame->received_size = 0U;
-        if (xQueueSend(handle->free_queue, &frame, 0) != pdPASS) {
-            return ESP_FAIL;
-        }
-    }
-    return ESP_OK;
-}
-
-static void hm01b0_capture_reset_diagnostics(
-    hm01b0_capture_handle_t *handle)
-{
-    const size_t buffer_capacity = handle->stats.buffer_capacity;
-    handle->stats = (hm01b0_capture_stats_t) {
-        .raw_width = handle->config.raw_width,
-        .raw_height = handle->config.raw_height,
-        .raw_stride = handle->config.raw_width,
-        .active_x = handle->config.active_x,
-        .active_y = handle->config.active_y,
-        .active_width = handle->config.active_width,
-        .active_height = handle->config.active_height,
-        .payload_size = (size_t)handle->config.raw_width *
-                        handle->config.raw_height,
-        .active_payload_size = (size_t)handle->config.active_width *
-                               handle->config.active_height,
-        .buffer_capacity = buffer_capacity,
-    };
-    handle->isr_sequence = 0U;
-    handle->isr_frames_received = 0U;
-    handle->isr_no_free_buffer = 0U;
-    handle->isr_ready_queue_overflows = 0U;
-    handle->isr_free_queue_errors = 0U;
-    handle->task_free_queue_errors = 0U;
-    handle->baseline_crc_valid = false;
-    handle->previous_active_crc_valid = false;
-    handle->baseline_received_size_valid = false;
-    handle->processed_frames = 0U;
-    handle->first_analysis_logged = false;
-    handle->last_error_log_time_us = 0;
-    handle->last_stats_time_us = esp_timer_get_time();
-    handle->last_stats_frame_count = 0U;
-}
-
 static bool hm01b0_capture_valid_dma_burst(uint32_t burst_size)
 {
     return burst_size == 0U ||
@@ -206,55 +95,25 @@ static bool hm01b0_capture_valid_dma_burst(uint32_t burst_size)
             (burst_size & (burst_size - 1U)) == 0U);
 }
 
+static bool hm01b0_capture_rect_is_valid(
+    const hm01b0_capture_handle_t *handle,
+    hm01b0_frame_rect_t rect)
+{
+    return rect.width > 0U && rect.height > 0U &&
+           rect.x < handle->config.frame_width &&
+           rect.y < handle->config.frame_height &&
+           rect.width <= handle->config.frame_width - rect.x &&
+           rect.height <= handle->config.frame_height - rect.y;
+}
+
 static esp_err_t hm01b0_capture_validate_config(
     const hm01b0_capture_config_t *config)
 {
     ESP_RETURN_ON_FALSE(config != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "configuration is NULL");
-    ESP_RETURN_ON_FALSE(config->raw_width > 0U && config->raw_height > 0U,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid raw geometry");
-    ESP_RETURN_ON_FALSE(config->active_width > 0U &&
-                        config->active_height > 0U &&
-                        config->active_x < config->raw_width &&
-                        config->active_y < config->raw_height &&
-                        config->active_width <=
-                            config->raw_width - config->active_x &&
-                        config->active_height <=
-                            config->raw_height - config->active_y,
-                        ESP_ERR_INVALID_ARG, TAG,
-                        "active area is outside the raw frame");
-    ESP_RETURN_ON_FALSE(
-        config->pattern_analysis >= HM01B0_CAPTURE_PATTERN_ANALYSIS_NONE &&
-        config->pattern_analysis <=
-            HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR,
-        ESP_ERR_INVALID_ARG, TAG, "invalid test-pattern analysis mode");
-    const bool snapshot_configured =
-        config->snapshot_buffer != NULL ||
-        config->snapshot_buffer_size != 0U ||
-        config->snapshot_width != 0U ||
-        config->snapshot_height != 0U ||
-        config->on_snapshot_ready != NULL;
-    if (snapshot_configured) {
-        const size_t snapshot_size =
-            (size_t)config->snapshot_width * config->snapshot_height;
-        ESP_RETURN_ON_FALSE(config->snapshot_buffer != NULL &&
-                            config->on_snapshot_ready != NULL &&
-                            config->snapshot_width > 0U &&
-                            config->snapshot_height > 0U,
-                            ESP_ERR_INVALID_ARG, TAG,
-                            "incomplete snapshot configuration");
-        ESP_RETURN_ON_FALSE(config->snapshot_x < config->raw_width &&
-                            config->snapshot_y < config->raw_height &&
-                            config->snapshot_width <=
-                                config->raw_width - config->snapshot_x &&
-                            config->snapshot_height <=
-                                config->raw_height - config->snapshot_y,
-                            ESP_ERR_INVALID_ARG, TAG,
-                            "snapshot area is outside the raw frame");
-        ESP_RETURN_ON_FALSE(config->snapshot_buffer_size >= snapshot_size,
-                            ESP_ERR_INVALID_SIZE, TAG,
-                            "snapshot buffer is too small");
-    }
+    ESP_RETURN_ON_FALSE(config->frame_width > 0U &&
+                        config->frame_height > 0U,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid frame geometry");
     ESP_RETURN_ON_FALSE(GPIO_IS_VALID_GPIO(config->pclk_gpio) &&
                         GPIO_IS_VALID_GPIO(config->vsync_gpio) &&
                         GPIO_IS_VALID_GPIO(config->de_gpio),
@@ -267,9 +126,57 @@ static esp_err_t hm01b0_capture_validate_config(
     ESP_RETURN_ON_FALSE(hm01b0_capture_valid_dma_burst(
                             config->dma_burst_size),
                         ESP_ERR_INVALID_ARG, TAG, "invalid DMA burst size");
-    ESP_RETURN_ON_FALSE(config->task_priority < configMAX_PRIORITIES,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid task priority");
     return ESP_OK;
+}
+
+static esp_err_t hm01b0_capture_reset_queues(
+    hm01b0_capture_handle_t *handle)
+{
+    xQueueReset(handle->free_queue);
+    xQueueReset(handle->ready_queue);
+    for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
+        hm01b0_capture_frame_t *frame = &handle->frames[i];
+        frame->received_size = 0U;
+        frame->sequence = 0U;
+        frame->timestamp_us = 0;
+        if (xQueueSend(handle->free_queue, &frame, 0) != pdPASS) {
+            return ESP_FAIL;
+        }
+    }
+    return ESP_OK;
+}
+
+static void hm01b0_capture_reset_session(hm01b0_capture_handle_t *handle)
+{
+    const size_t capacity = handle->transport.buffer_capacity;
+    handle->transport = (hm01b0_capture_transport_stats_t) {
+        .frame_width = handle->config.frame_width,
+        .frame_height = handle->config.frame_height,
+        .frame_stride = handle->config.frame_width,
+        .payload_size = (size_t)handle->config.frame_width *
+                        handle->config.frame_height,
+        .buffer_capacity = capacity,
+    };
+    handle->diagnostic_report = (hm01b0_diagnostic_report_t) {
+        .pattern = handle->diagnostic_enabled
+                       ? handle->diagnostic_config.pattern
+                       : HM01B0_DIAGNOSTIC_PATTERN_NONE,
+        .status = HM01B0_DIAGNOSTIC_STATUS_NOT_RUN,
+    };
+    handle->snapshot_result = (hm01b0_snapshot_result_t) {0};
+    handle->isr_sequence = 0U;
+    handle->isr_frames_received = 0U;
+    handle->isr_no_free_buffer = 0U;
+    handle->isr_ready_queue_overflows = 0U;
+    handle->isr_free_queue_errors = 0U;
+    handle->task_free_queue_errors = 0U;
+    handle->processed_frames = 0U;
+    handle->baseline_received_size_valid = false;
+    handle->diagnostic_baseline_valid = false;
+    handle->first_diagnostic_logged = false;
+    handle->last_error_log_time_us = 0;
+    handle->last_stats_time_us = esp_timer_get_time();
+    handle->last_stats_frame_count = 0U;
 }
 
 static hm01b0_capture_frame_t *IRAM_ATTR hm01b0_capture_find_frame(
@@ -300,14 +207,13 @@ static bool IRAM_ATTR hm01b0_capture_on_get_new_trans(
     } else {
         result = xQueueReceive(handle->free_queue, &frame, 0);
     }
-
     if (result != pdPASS || frame == NULL) {
         handle->isr_no_free_buffer++;
         return task_woken == pdTRUE;
     }
 
     trans->buffer = frame->data;
-    trans->buflen = handle->stats.buffer_capacity;
+    trans->buflen = frame->capacity;
     return task_woken == pdTRUE;
 }
 
@@ -329,6 +235,8 @@ static bool IRAM_ATTR hm01b0_capture_on_trans_finished(
 
     frame->received_size = trans->received_size;
     frame->sequence = ++handle->isr_sequence;
+    /* Timestamp in task context to keep the ISR callback minimal. */
+    frame->timestamp_us = 0;
     handle->isr_frames_received++;
 
     if (xQueueSendFromISR(handle->ready_queue, &frame, &task_woken) != pdPASS) {
@@ -338,231 +246,12 @@ static bool IRAM_ATTR hm01b0_capture_on_trans_finished(
             handle->isr_free_queue_errors++;
         }
     }
-
     return task_woken == pdTRUE;
 }
 
-static bool hm01b0_is_one_hot(uint8_t value)
-{
-    return value != 0U && (value & (uint8_t)(value - 1U)) == 0U;
-}
-
-static size_t hm01b0_select_pattern_sample_rows(
-    uint16_t active_y,
-    uint16_t active_height,
-    uint16_t rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS])
-{
-    const uint16_t offsets[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {
-        0U,
-        active_height > 1U ? 1U : 0U,
-        (uint16_t)(active_height / 2U),
-        (uint16_t)(active_height - 1U),
-    };
-    size_t count = 0U;
-
-    for (size_t i = 0; i < HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS; ++i) {
-        const uint16_t row = (uint16_t)(active_y + offsets[i]);
-        bool duplicate = false;
-        for (size_t j = 0; j < count; ++j) {
-            if (rows[j] == row) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) {
-            rows[count++] = row;
-        }
-    }
-
-    return count;
-}
-
-static uint32_t hm01b0_capture_active_crc(
-    const hm01b0_capture_handle_t *handle,
-    const uint8_t *data)
-{
-    uint32_t crc = 0U;
-    const size_t stride = handle->config.raw_width;
-    for (uint16_t y = 0; y < handle->config.active_height; ++y) {
-        const size_t offset =
-            (size_t)(handle->config.active_y + y) * stride +
-            handle->config.active_x;
-        crc = esp_crc32_le(crc, data + offset,
-                           handle->config.active_width);
-    }
-    return crc;
-}
-
-static hm01b0_walking_analysis_t hm01b0_analyze_walking_one(
-    const uint8_t *data,
-    uint16_t stride,
-    uint16_t active_x,
-    uint16_t active_y,
-    uint16_t active_width,
-    uint16_t active_height)
-{
-    hm01b0_walking_analysis_t result = {0};
-    uint32_t seen_values[8] = {0};
-    uint16_t sample_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {0};
-
-    if (data == NULL || stride == 0U || active_width == 0U ||
-        active_height == 0U) {
-        return result;
-    }
-
-    const size_t sample_count = hm01b0_select_pattern_sample_rows(
-        active_y, active_height, sample_rows);
-    result.sampled_rows = (uint32_t)sample_count;
-
-    const uint8_t *reference = data +
-                               (size_t)sample_rows[0] * stride + active_x;
-    for (uint16_t x = 0; x < active_width; ++x) {
-        if (x > 0U && reference[x] != reference[x - 1U]) {
-            result.horizontal_transitions++;
-        }
-    }
-
-    for (size_t sample_index = 0; sample_index < sample_count;
-         ++sample_index) {
-        const uint8_t *row = data +
-                             (size_t)sample_rows[sample_index] * stride +
-                             active_x;
-        bool row_equal = true;
-        for (uint16_t x = 0; x < active_width; ++x) {
-            const uint8_t value = row[x];
-            const uint32_t value_bit = 1UL << (value & 31U);
-            uint32_t *const seen_word = &seen_values[value >> 5U];
-            if ((*seen_word & value_bit) == 0U) {
-                *seen_word |= value_bit;
-                result.unique_values++;
-            }
-            if (value == 0U) {
-                result.zero_values++;
-            } else if (hm01b0_is_one_hot(value)) {
-                result.one_hot_values++;
-            } else {
-                result.other_values++;
-            }
-            if (sample_index > 0U && value != reference[x]) {
-                result.vertical_mismatches++;
-                row_equal = false;
-            }
-        }
-        if (sample_index > 0U) {
-            result.rows_compared++;
-            if (row_equal) {
-                result.rows_equal++;
-            }
-        }
-    }
-
-    return result;
-}
-
-/*
- * The datasheet defines six vertical bars but not their exact RAW8 codes.
- * Observe representative-row consistency and horizontal structure without
- * turning undocumented byte values into pass/fail criteria.
- */
-static hm01b0_color_bar_analysis_t hm01b0_analyze_color_bar(
-    const uint8_t *data,
-    uint16_t stride,
-    uint16_t active_x,
-    uint16_t active_y,
-    uint16_t active_width,
-    uint16_t active_height)
-{
-    hm01b0_color_bar_analysis_t result = {
-        .min_value = UINT8_MAX,
-    };
-    uint32_t seen_values[8] = {0};
-    uint16_t sample_rows[HM01B0_CAPTURE_PATTERN_SAMPLE_ROWS] = {0};
-
-    if (data == NULL || stride == 0U || active_width == 0U ||
-        active_height == 0U) {
-        result.min_value = 0U;
-        return result;
-    }
-
-    const size_t sample_count = hm01b0_select_pattern_sample_rows(
-        active_y, active_height, sample_rows);
-    result.sampled_rows = (uint32_t)sample_count;
-
-    const uint8_t *reference = data +
-                               (size_t)sample_rows[0] * stride + active_x;
-    for (uint16_t x = 1U; x < active_width; ++x) {
-        if (reference[x] != reference[x - 1U]) {
-            result.horizontal_transitions++;
-        }
-        const unsigned delta = reference[x] > reference[x - 1U]
-                                   ? reference[x] - reference[x - 1U]
-                                   : reference[x - 1U] - reference[x];
-        if (delta >= HM01B0_CAPTURE_COLOR_BAR_STRONG_DELTA) {
-            result.strong_transitions++;
-        }
-    }
-
-    uint16_t center_offsets[HM01B0_CAPTURE_COLOR_BAR_COUNT] = {0};
-    for (size_t bar = 0; bar < HM01B0_CAPTURE_COLOR_BAR_COUNT; ++bar) {
-        const uint32_t numerator =
-            (uint32_t)(2U * bar + 1U) * active_width;
-        uint16_t center = (uint16_t)(
-            numerator / (2U * HM01B0_CAPTURE_COLOR_BAR_COUNT));
-        if (center >= active_width) {
-            center = (uint16_t)(active_width - 1U);
-        }
-        center_offsets[bar] = center;
-        result.center_values[bar] = reference[center];
-        if (bar > 0U &&
-            result.center_values[bar] != result.center_values[bar - 1U]) {
-            result.center_changes++;
-        }
-    }
-
-    for (size_t sample_index = 0; sample_index < sample_count;
-         ++sample_index) {
-        const uint8_t *row = data +
-                             (size_t)sample_rows[sample_index] * stride +
-                             active_x;
-        bool row_equal = true;
-        for (uint16_t x = 0; x < active_width; ++x) {
-            const uint8_t value = row[x];
-            const uint32_t value_bit = 1UL << (value & 31U);
-            uint32_t *const seen_word = &seen_values[value >> 5U];
-            if ((*seen_word & value_bit) == 0U) {
-                *seen_word |= value_bit;
-                result.unique_values++;
-            }
-            if (value < result.min_value) {
-                result.min_value = value;
-            }
-            if (value > result.max_value) {
-                result.max_value = value;
-            }
-            if (sample_index > 0U && value != reference[x]) {
-                result.vertical_mismatches++;
-                row_equal = false;
-            }
-        }
-        if (sample_index > 0U) {
-            result.rows_compared++;
-            if (row_equal) {
-                result.rows_equal++;
-            }
-            for (size_t bar = 0; bar < HM01B0_CAPTURE_COLOR_BAR_COUNT;
-                 ++bar) {
-                if (row[center_offsets[bar]] != result.center_values[bar]) {
-                    result.center_vertical_mismatches++;
-                }
-            }
-        }
-    }
-
-    return result;
-}
-
-static bool hm01b0_capture_error_log_allowed(hm01b0_capture_handle_t *handle,
-                                              int64_t now_us)
+static bool hm01b0_capture_error_log_allowed(
+    hm01b0_capture_handle_t *handle,
+    int64_t now_us)
 {
     if (handle->last_error_log_time_us == 0 ||
         now_us - handle->last_error_log_time_us >= 1000000LL) {
@@ -572,326 +261,259 @@ static bool hm01b0_capture_error_log_allowed(hm01b0_capture_handle_t *handle,
     return false;
 }
 
+static void hm01b0_capture_update_isr_stats(
+    hm01b0_capture_handle_t *handle)
+{
+    handle->transport.frames_received = handle->isr_frames_received;
+    handle->transport.no_free_buffer = handle->isr_no_free_buffer;
+    handle->transport.ready_queue_overflows =
+        handle->isr_ready_queue_overflows;
+    handle->transport.free_queue_errors = handle->isr_free_queue_errors +
+                                          handle->task_free_queue_errors;
+}
+
+static void hm01b0_capture_log_diagnostic(
+    const hm01b0_diagnostic_report_t *report)
+{
+    if (report->analyzed_frames == 0U) {
+        return;
+    }
+    ESP_LOGI(TAG,
+             "%s preflight=%s analyzed=%" PRIu32
+             " warmup=%" PRIu32 " raw_crc=%08" PRIX32
+             " active_crc=%08" PRIX32,
+             hm01b0_diagnostic_pattern_name(report->pattern),
+             hm01b0_diagnostic_status_name(report->status),
+             report->analyzed_frames, report->warmup_frames,
+             report->last_raw_crc, report->last_active_crc);
+
+    if (report->pattern == HM01B0_DIAGNOSTIC_PATTERN_WALKING_1) {
+        const hm01b0_walking_1_result_t *result = &report->result.walking_1;
+        ESP_LOGI(TAG,
+                 "Walking-1 rows=%" PRIu32 " equal=%" PRIu32 "/%" PRIu32
+                 " vertical_mismatch=%" PRIu32 " transitions=%" PRIu32
+                 " unique=%" PRIu32 " values(zero=%" PRIu32
+                 ",one_hot=%" PRIu32 ",other=%" PRIu32 ")",
+                 result->sampled_rows, result->rows_equal,
+                 result->rows_compared, result->vertical_mismatches,
+                 result->horizontal_transitions, result->unique_values,
+                 result->zero_values, result->one_hot_values,
+                 result->other_values);
+    } else if (report->pattern == HM01B0_DIAGNOSTIC_PATTERN_COLOR_BAR) {
+        const hm01b0_color_bar_result_t *result = &report->result.color_bar;
+        ESP_LOGI(TAG,
+                 "Color-Bar rows=%" PRIu32 " equal=%" PRIu32 "/%" PRIu32
+                 " transitions=%" PRIu32 " strong=%" PRIu32
+                 " unique=%" PRIu32 " range=%02X..%02X",
+                 result->sampled_rows, result->rows_equal,
+                 result->rows_compared, result->horizontal_transitions,
+                 result->strong_transitions, result->unique_values,
+                 (unsigned)result->min_value, (unsigned)result->max_value);
+        ESP_LOGI(TAG,
+                 "Color-Bar centers=[%02X %02X %02X %02X %02X %02X] "
+                 "changes=%" PRIu32 "/5 center_vertical_mismatch=%" PRIu32,
+                 (unsigned)result->center_values[0],
+                 (unsigned)result->center_values[1],
+                 (unsigned)result->center_values[2],
+                 (unsigned)result->center_values[3],
+                 (unsigned)result->center_values[4],
+                 (unsigned)result->center_values[5],
+                 result->center_changes,
+                 result->center_vertical_mismatches);
+    }
+}
+
 static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
                                      int64_t now_us)
 {
-    handle->stats.frames_received = handle->isr_frames_received;
-    handle->stats.no_free_buffer = handle->isr_no_free_buffer;
-    handle->stats.ready_queue_overflows =
-        handle->isr_ready_queue_overflows;
-    handle->stats.free_queue_errors = handle->isr_free_queue_errors +
-                                      handle->task_free_queue_errors;
+    hm01b0_capture_update_isr_stats(handle);
     const int64_t elapsed_us = now_us - handle->last_stats_time_us;
-    const uint32_t frames_now = handle->stats.frames_received;
-    const uint32_t frames_delta = frames_now - handle->last_stats_frame_count;
-
     if (elapsed_us <= 0) {
         return;
     }
-
-    handle->stats.fps_milli = (uint32_t)(
+    const uint32_t frames_now = handle->transport.frames_received;
+    const uint32_t frames_delta = frames_now - handle->last_stats_frame_count;
+    handle->transport.fps_milli = (uint32_t)(
         ((uint64_t)frames_delta * 1000000000ULL) / (uint64_t)elapsed_us);
     handle->last_stats_time_us = now_us;
     handle->last_stats_frame_count = frames_now;
 
     ESP_LOGI(TAG,
              "fps=%" PRIu32 ".%03" PRIu32 " received=%" PRIu32
-             " transport_ok=%" PRIu32 " warmup=%" PRIu32
-             " size_err=%" PRIu32 " size_change=%" PRIu32,
-             handle->stats.fps_milli / 1000U,
-             handle->stats.fps_milli % 1000U,
-             handle->stats.frames_received,
-             handle->stats.transport_valid_frames,
-             handle->stats.warmup_frames,
-             handle->stats.size_errors,
-             handle->stats.received_size_changes);
+             " valid=%" PRIu32 " size_err=%" PRIu32
+             " no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
+             " free_err=%" PRIu32,
+             handle->transport.fps_milli / 1000U,
+             handle->transport.fps_milli % 1000U,
+             handle->transport.frames_received,
+             handle->transport.valid_frames,
+             handle->transport.size_errors,
+             handle->transport.no_free_buffer,
+             handle->transport.ready_queue_overflows,
+             handle->transport.free_queue_errors);
     ESP_LOGI(TAG,
-             "crc raw=%08" PRIX32 " active=%08" PRIX32
-             " changes(raw_base=%" PRIu32 ",active_base=%" PRIu32
-             ",active_prev=%" PRIu32 ")",
-             handle->stats.last_raw_crc,
-             handle->stats.last_active_crc,
-             handle->stats.raw_crc_changes,
-             handle->stats.active_crc_changes,
-             handle->stats.active_crc_frame_changes);
-    if (handle->config.pattern_analysis ==
-            HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1 &&
-        handle->stats.walking_analysis_frames > 0U) {
-        ESP_LOGI(TAG,
-                 "Walking-1 observe sampled_rows=%" PRIu32
-                 " equal=%" PRIu32 "/%" PRIu32
-                 " sampled_vertical_mismatch=%" PRIu32
-                 " transitions=%" PRIu32 " sampled_unique=%" PRIu32
-                 " sampled_values(zero=%" PRIu32 ",one_hot=%" PRIu32
-                 ",other=%" PRIu32 ")",
-                 handle->stats.walking_sampled_rows,
-                 handle->stats.walking_sampled_rows_equal,
-                 handle->stats.walking_sampled_rows_compared,
-                 handle->stats.walking_sampled_vertical_mismatches,
-                 handle->stats.walking_horizontal_transitions,
-                 handle->stats.walking_sampled_unique_values,
-                 handle->stats.walking_sampled_zero_values,
-                 handle->stats.walking_sampled_one_hot_values,
-                 handle->stats.walking_sampled_other_values);
-    } else if (handle->config.pattern_analysis ==
-                   HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR &&
-               handle->stats.color_bar_analysis_frames > 0U) {
-        ESP_LOGI(TAG,
-                 "Color-Bar observe sampled_rows=%" PRIu32
-                 " equal=%" PRIu32 "/%" PRIu32
-                 " sampled_vertical_mismatch=%" PRIu32
-                 " transitions=%" PRIu32 " strong=%" PRIu32
-                 " sampled_unique=%" PRIu32 " range=%02X..%02X",
-                 handle->stats.color_bar_sampled_rows,
-                 handle->stats.color_bar_sampled_rows_equal,
-                 handle->stats.color_bar_sampled_rows_compared,
-                 handle->stats.color_bar_sampled_vertical_mismatches,
-                 handle->stats.color_bar_horizontal_transitions,
-                 handle->stats.color_bar_strong_transitions,
-                 handle->stats.color_bar_sampled_unique_values,
-                 (unsigned)handle->stats.color_bar_min_value,
-                 (unsigned)handle->stats.color_bar_max_value);
-        ESP_LOGI(TAG,
-                 "Color-Bar centers=[%02X %02X %02X %02X %02X %02X] "
-                 "changes=%" PRIu32 "/5 center_vertical_mismatch=%" PRIu32,
-                 (unsigned)handle->stats.color_bar_center_values[0],
-                 (unsigned)handle->stats.color_bar_center_values[1],
-                 (unsigned)handle->stats.color_bar_center_values[2],
-                 (unsigned)handle->stats.color_bar_center_values[3],
-                 (unsigned)handle->stats.color_bar_center_values[4],
-                 (unsigned)handle->stats.color_bar_center_values[5],
-                 handle->stats.color_bar_center_changes,
-                 handle->stats.color_bar_center_vertical_mismatches);
-    }
-    ESP_LOGI(TAG,
-             "no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
-             " free_err=%" PRIu32
-             " process_last=%" PRIu32 "us process_max=%" PRIu32
+             "process_last=%" PRIu32 "us process_max=%" PRIu32
              "us hold_last=%" PRIu32 "us hold_max=%" PRIu32
              "us queues(free=%u,ready=%u)",
-             handle->stats.no_free_buffer,
-             handle->stats.ready_queue_overflows,
-             handle->stats.free_queue_errors,
-             handle->stats.last_processing_time_us,
-             handle->stats.max_processing_time_us,
-             handle->stats.last_buffer_hold_time_us,
-             handle->stats.max_buffer_hold_time_us,
+             handle->transport.last_processing_time_us,
+             handle->transport.max_processing_time_us,
+             handle->transport.last_buffer_hold_time_us,
+             handle->transport.max_buffer_hold_time_us,
              (unsigned)uxQueueMessagesWaiting(handle->free_queue),
              (unsigned)uxQueueMessagesWaiting(handle->ready_queue));
+    hm01b0_capture_log_diagnostic(&handle->diagnostic_report);
 }
 
-static bool hm01b0_capture_process_frame(hm01b0_capture_handle_t *handle,
-                                         hm01b0_capture_frame_t *frame)
+static void hm01b0_capture_log_first_sample(
+    const hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame)
 {
-    const int64_t start_us = esp_timer_get_time();
-    bool ready_for_snapshot = false;
-    handle->stats.received_size = frame->received_size;
-    handle->processed_frames++;
-    bool size_valid = frame->received_size == handle->stats.payload_size;
+    const size_t raw_count =
+        handle->config.frame_width < HM01B0_CAPTURE_FIRST_SAMPLE_SIZE
+            ? handle->config.frame_width
+            : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
+    const size_t active_count =
+        handle->diagnostic_config.area.width < HM01B0_CAPTURE_FIRST_SAMPLE_SIZE
+            ? handle->diagnostic_config.area.width
+            : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
+    const size_t active_offset =
+        (size_t)handle->diagnostic_config.area.y *
+            handle->config.frame_width +
+        handle->diagnostic_config.area.x;
+
+    ESP_LOGI(TAG,
+             "first diagnostic frame=%" PRIu32 " received=%u",
+             frame->sequence, (unsigned)frame->received_size);
+    ESP_LOGI(TAG, "raw row y=0 x=0..%u", (unsigned)(raw_count - 1U));
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame->data, raw_count, ESP_LOG_INFO);
+    ESP_LOGI(TAG, "analysis row y=%u x=%u..%u",
+             (unsigned)handle->diagnostic_config.area.y,
+             (unsigned)handle->diagnostic_config.area.x,
+             (unsigned)(handle->diagnostic_config.area.x +
+                        active_count - 1U));
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame->data + active_offset,
+                             active_count, ESP_LOG_INFO);
+}
+
+static void hm01b0_capture_process_transport(
+    hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame,
+    int64_t now_us,
+    bool *size_valid)
+{
+    handle->transport.last_received_size = frame->received_size;
+    *size_valid = frame->received_size == handle->transport.payload_size;
 
     if (!handle->baseline_received_size_valid) {
         handle->baseline_received_size = frame->received_size;
         handle->baseline_received_size_valid = true;
     } else if (frame->received_size != handle->baseline_received_size) {
-        handle->stats.received_size_changes++;
+        handle->transport.received_size_changes++;
     }
 
-    if (!size_valid) {
-        handle->stats.size_errors++;
-        if (hm01b0_capture_error_log_allowed(handle, start_us)) {
+    if (*size_valid) {
+        handle->transport.valid_frames++;
+    } else {
+        handle->transport.size_errors++;
+        if (hm01b0_capture_error_log_allowed(handle, now_us)) {
             ESP_LOGE(TAG,
                      "frame=%" PRIu32 " size error: received=%u payload=%u "
                      "capacity=%u",
-                     frame->sequence,
-                     (unsigned)frame->received_size,
-                     (unsigned)handle->stats.payload_size,
-                     (unsigned)handle->stats.buffer_capacity);
+                     frame->sequence, (unsigned)frame->received_size,
+                     (unsigned)handle->transport.payload_size,
+                     (unsigned)handle->transport.buffer_capacity);
         }
-    }
-
-    if (size_valid) {
-        handle->stats.transport_valid_frames++;
-    }
-
-    if (!size_valid) {
-        goto finish;
-    }
-
-    if (handle->processed_frames <= handle->config.warmup_frames) {
-        handle->stats.warmup_frames++;
-        goto finish;
-    }
-
-    const uint32_t raw_crc = esp_crc32_le(
-        0U, frame->data, (uint32_t)handle->stats.payload_size);
-    const uint32_t active_crc = hm01b0_capture_active_crc(handle,
-                                                          frame->data);
-    handle->stats.last_raw_crc = raw_crc;
-    handle->stats.last_active_crc = active_crc;
-
-    if (!handle->baseline_crc_valid) {
-        handle->baseline_raw_crc = raw_crc;
-        handle->baseline_active_crc = active_crc;
-        handle->baseline_crc_valid = true;
-    } else {
-        if (raw_crc != handle->baseline_raw_crc) {
-            handle->stats.raw_crc_changes++;
-        }
-        if (active_crc != handle->baseline_active_crc) {
-            handle->stats.active_crc_changes++;
-        }
-    }
-    if (handle->previous_active_crc_valid &&
-        active_crc != handle->previous_active_crc) {
-        handle->stats.active_crc_frame_changes++;
-    }
-    handle->previous_active_crc = active_crc;
-    handle->previous_active_crc_valid = true;
-
-    if (handle->config.pattern_analysis ==
-        HM01B0_CAPTURE_PATTERN_ANALYSIS_WALKING_1) {
-        const hm01b0_walking_analysis_t analysis =
-            hm01b0_analyze_walking_one(
-                frame->data, handle->config.raw_width,
-                handle->config.active_x, handle->config.active_y,
-                handle->config.active_width, handle->config.active_height);
-        handle->stats.walking_analysis_frames++;
-        handle->stats.walking_sampled_rows = analysis.sampled_rows;
-        handle->stats.walking_sampled_rows_equal = analysis.rows_equal;
-        handle->stats.walking_sampled_rows_compared =
-            analysis.rows_compared;
-        handle->stats.walking_sampled_vertical_mismatches =
-            analysis.vertical_mismatches;
-        handle->stats.walking_horizontal_transitions =
-            analysis.horizontal_transitions;
-        handle->stats.walking_sampled_unique_values =
-            analysis.unique_values;
-        handle->stats.walking_sampled_zero_values = analysis.zero_values;
-        handle->stats.walking_sampled_one_hot_values =
-            analysis.one_hot_values;
-        handle->stats.walking_sampled_other_values = analysis.other_values;
-    } else if (handle->config.pattern_analysis ==
-               HM01B0_CAPTURE_PATTERN_ANALYSIS_COLOR_BAR) {
-        const hm01b0_color_bar_analysis_t analysis =
-            hm01b0_analyze_color_bar(
-                frame->data, handle->config.raw_width,
-                handle->config.active_x, handle->config.active_y,
-                handle->config.active_width, handle->config.active_height);
-        handle->stats.color_bar_analysis_frames++;
-        handle->stats.color_bar_sampled_rows = analysis.sampled_rows;
-        handle->stats.color_bar_sampled_rows_equal = analysis.rows_equal;
-        handle->stats.color_bar_sampled_rows_compared =
-            analysis.rows_compared;
-        handle->stats.color_bar_sampled_vertical_mismatches =
-            analysis.vertical_mismatches;
-        handle->stats.color_bar_horizontal_transitions =
-            analysis.horizontal_transitions;
-        handle->stats.color_bar_strong_transitions =
-            analysis.strong_transitions;
-        handle->stats.color_bar_sampled_unique_values =
-            analysis.unique_values;
-        handle->stats.color_bar_center_changes = analysis.center_changes;
-        handle->stats.color_bar_center_vertical_mismatches =
-            analysis.center_vertical_mismatches;
-        handle->stats.color_bar_min_value = analysis.min_value;
-        handle->stats.color_bar_max_value = analysis.max_value;
-        memcpy(handle->stats.color_bar_center_values,
-               analysis.center_values, sizeof(analysis.center_values));
-    }
-    ready_for_snapshot = true;
-
-finish:
-    ;
-    const int64_t end_us = esp_timer_get_time();
-    const uint32_t processing_time = (uint32_t)(end_us - start_us);
-    handle->stats.last_processing_time_us = processing_time;
-    if (processing_time > handle->stats.max_processing_time_us) {
-        handle->stats.max_processing_time_us = processing_time;
-    }
-    return ready_for_snapshot;
-}
-
-static void hm01b0_capture_take_analysis_sample(
-    const hm01b0_capture_handle_t *handle,
-    const hm01b0_capture_frame_t *frame,
-    hm01b0_analysis_sample_t *sample)
-{
-    sample->sequence = frame->sequence;
-    sample->warmup_frames = handle->config.warmup_frames;
-    sample->received_size = frame->received_size;
-    sample->raw_crc = handle->stats.last_raw_crc;
-    sample->active_crc = handle->stats.last_active_crc;
-    sample->raw_sample_size =
-        handle->config.raw_width < HM01B0_CAPTURE_FIRST_SAMPLE_SIZE
-            ? handle->config.raw_width
-            : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
-    sample->active_sample_size =
-        handle->config.active_width < HM01B0_CAPTURE_FIRST_SAMPLE_SIZE
-            ? handle->config.active_width
-            : HM01B0_CAPTURE_FIRST_SAMPLE_SIZE;
-    sample->active_x = handle->config.active_x;
-    sample->active_row_count = hm01b0_select_pattern_sample_rows(
-        handle->config.active_y, handle->config.active_height,
-        sample->active_rows);
-
-    memcpy(sample->raw, frame->data, sample->raw_sample_size);
-    for (size_t i = 0; i < sample->active_row_count; ++i) {
-        const size_t offset = (size_t)sample->active_rows[i] *
-                                  handle->config.raw_width +
-                              handle->config.active_x;
-        memcpy(sample->active[i], frame->data + offset,
-               sample->active_sample_size);
     }
 }
 
-static void hm01b0_capture_log_first_analysis(
-    const hm01b0_analysis_sample_t *sample)
-{
-    ESP_LOGI(TAG, "warm-up complete: skipped=%" PRIu32 " frames",
-             sample->warmup_frames);
-    ESP_LOGI(TAG,
-             "first analyzed frame: sequence=%" PRIu32
-             " received=%u raw_crc=%08" PRIX32
-             " active_crc=%08" PRIX32,
-             sample->sequence, (unsigned)sample->received_size,
-             sample->raw_crc, sample->active_crc);
-    ESP_LOGI(TAG, "raw row y=0 x=0..%u",
-             (unsigned)(sample->raw_sample_size - 1U));
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, sample->raw, sample->raw_sample_size,
-                             ESP_LOG_INFO);
-
-    for (size_t i = 0; i < sample->active_row_count; ++i) {
-        ESP_LOGI(TAG, "active row y=%u x=%u..%u",
-                 (unsigned)sample->active_rows[i],
-                 (unsigned)sample->active_x,
-                 (unsigned)(sample->active_x +
-                            sample->active_sample_size - 1U));
-        ESP_LOG_BUFFER_HEX_LEVEL(TAG, sample->active[i],
-                                 sample->active_sample_size, ESP_LOG_INFO);
-    }
-}
-
-static void hm01b0_capture_copy_snapshot(
-    const hm01b0_capture_handle_t *handle,
+static void hm01b0_capture_process_diagnostics(
+    hm01b0_capture_handle_t *handle,
     const hm01b0_capture_frame_t *frame)
 {
-    const size_t source_stride = handle->config.raw_width;
-    const size_t snapshot_stride = handle->config.snapshot_width;
-    for (uint16_t y = 0; y < handle->config.snapshot_height; ++y) {
-        const size_t source_offset =
-            (size_t)(handle->config.snapshot_y + y) * source_stride +
-            handle->config.snapshot_x;
-        const size_t snapshot_offset = (size_t)y * snapshot_stride;
-        memcpy(handle->config.snapshot_buffer + snapshot_offset,
-               frame->data + source_offset, snapshot_stride);
+    if (!handle->diagnostic_enabled) {
+        return;
     }
+    if (handle->processed_frames <= handle->diagnostic_config.warmup_frames) {
+        handle->diagnostic_report.warmup_frames++;
+        return;
+    }
+
+    if (hm01b0_diagnostics_analyze_frame(
+            handle->diagnostic_config.pattern,
+            frame->data,
+            handle->config.frame_width,
+            handle->config.frame_height,
+            handle->config.frame_width,
+            handle->diagnostic_config.area,
+            &handle->diagnostic_report) != ESP_OK) {
+        handle->diagnostic_report.status = HM01B0_DIAGNOSTIC_STATUS_WARNING;
+        return;
+    }
+
+    if (!handle->diagnostic_baseline_valid) {
+        handle->diagnostic_baseline_raw_crc =
+            handle->diagnostic_report.last_raw_crc;
+        handle->diagnostic_baseline_active_crc =
+            handle->diagnostic_report.last_active_crc;
+        handle->diagnostic_baseline_valid = true;
+    } else {
+        if (handle->diagnostic_report.last_raw_crc !=
+            handle->diagnostic_baseline_raw_crc) {
+            handle->diagnostic_report.raw_crc_changes++;
+        }
+        if (handle->diagnostic_report.last_active_crc !=
+            handle->diagnostic_baseline_active_crc) {
+            handle->diagnostic_report.active_crc_changes++;
+        }
+    }
+
+    if (!handle->first_diagnostic_logged) {
+        ESP_LOGI(TAG, "warm-up complete: skipped=%" PRIu32 " frames",
+                 handle->diagnostic_report.warmup_frames);
+        hm01b0_capture_log_first_sample(handle, frame);
+        hm01b0_capture_log_diagnostic(&handle->diagnostic_report);
+        handle->first_diagnostic_logged = true;
+    }
+}
+
+static bool hm01b0_capture_process_snapshot(
+    hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame)
+{
+    if (!handle->snapshot_pending ||
+        handle->processed_frames <= handle->snapshot_request.skip_frames) {
+        return false;
+    }
+
+    const int64_t copy_start_us = esp_timer_get_time();
+    const esp_err_t ret = hm01b0_frame_crop_raw8(
+        frame->data,
+        handle->config.frame_width,
+        handle->config.frame_height,
+        handle->config.frame_width,
+        handle->snapshot_request.crop,
+        handle->snapshot_request.buffer,
+        handle->snapshot_request.buffer_size,
+        handle->snapshot_request.crop.width);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "snapshot copy failed: %s", esp_err_to_name(ret));
+        handle->snapshot_pending = false;
+        return false;
+    }
+
+    handle->snapshot_result.sequence = frame->sequence;
+    handle->snapshot_result.size =
+        (size_t)handle->snapshot_request.crop.width *
+        handle->snapshot_request.crop.height;
+    handle->snapshot_result.copy_time_us = (uint32_t)(
+        esp_timer_get_time() - copy_start_us);
+    handle->snapshot_pending = false;
+    return true;
 }
 
 static void hm01b0_capture_task(void *arg)
 {
     hm01b0_capture_handle_t *handle = arg;
-    handle->last_stats_time_us = esp_timer_get_time();
-    handle->last_stats_frame_count = handle->isr_frames_received;
 
     while (!handle->task_should_exit) {
         hm01b0_capture_frame_t *frame = NULL;
@@ -899,8 +521,9 @@ static void hm01b0_capture_task(void *arg)
                           pdMS_TO_TICKS(HM01B0_CAPTURE_QUEUE_WAIT_MS)) !=
             pdPASS) {
             const int64_t now_us = esp_timer_get_time();
-            if (now_us - handle->last_stats_time_us >=
-                (int64_t)handle->config.stats_period_ms * 1000LL) {
+            if (handle->controller_started &&
+                now_us - handle->last_stats_time_us >=
+                    (int64_t)HM01B0_CAPTURE_STATS_PERIOD_MS * 1000LL) {
                 hm01b0_capture_log_stats(handle, now_us);
             }
             continue;
@@ -908,34 +531,27 @@ static void hm01b0_capture_task(void *arg)
         if (frame == NULL) {
             continue;
         }
-        const int64_t buffer_hold_start_us = esp_timer_get_time();
-        handle->processing_frame = true;
 
-        hm01b0_analysis_sample_t first_sample;
-        bool log_first_analysis = false;
-        bool notify_snapshot_ready = false;
-        const bool ready_for_snapshot =
-            hm01b0_capture_process_frame(handle, frame);
-        if (!handle->first_analysis_logged && ready_for_snapshot) {
-            hm01b0_capture_take_analysis_sample(handle, frame,
-                                                 &first_sample);
-            handle->first_analysis_logged = true;
-            log_first_analysis = true;
+        const int64_t hold_start_us = esp_timer_get_time();
+        frame->timestamp_us = hold_start_us;
+        const int64_t process_start_us = hold_start_us;
+        handle->processing_frame = true;
+        handle->processed_frames++;
+
+        bool size_valid = false;
+        hm01b0_capture_process_transport(handle, frame, process_start_us,
+                                         &size_valid);
+        bool snapshot_ready = false;
+        if (size_valid) {
+            hm01b0_capture_process_diagnostics(handle, frame);
+            snapshot_ready = hm01b0_capture_process_snapshot(handle, frame);
         }
 
-        if (ready_for_snapshot &&
-            handle->config.snapshot_buffer != NULL &&
-            !handle->stats.snapshot_captured) {
-            const int64_t snapshot_start_us = esp_timer_get_time();
-            hm01b0_capture_copy_snapshot(handle, frame);
-            handle->stats.snapshot_copy_time_us = (uint32_t)(
-                esp_timer_get_time() - snapshot_start_us);
-            handle->stats.snapshot_sequence = frame->sequence;
-            handle->stats.snapshot_size =
-                (size_t)handle->config.snapshot_width *
-                handle->config.snapshot_height;
-            handle->stats.snapshot_captured = true;
-            notify_snapshot_ready = true;
+        const uint32_t processing_time_us = (uint32_t)(
+            esp_timer_get_time() - process_start_us);
+        handle->transport.last_processing_time_us = processing_time_us;
+        if (processing_time_us > handle->transport.max_processing_time_us) {
+            handle->transport.max_processing_time_us = processing_time_us;
         }
 
         const bool frame_returned =
@@ -943,45 +559,39 @@ static void hm01b0_capture_task(void *arg)
         if (!frame_returned) {
             handle->task_free_queue_errors++;
         }
-        const uint32_t buffer_hold_time_us = (uint32_t)(
-            esp_timer_get_time() - buffer_hold_start_us);
-        handle->stats.last_buffer_hold_time_us = buffer_hold_time_us;
-        if (buffer_hold_time_us > handle->stats.max_buffer_hold_time_us) {
-            handle->stats.max_buffer_hold_time_us = buffer_hold_time_us;
+        const uint32_t hold_time_us = (uint32_t)(
+            esp_timer_get_time() - hold_start_us);
+        handle->transport.last_buffer_hold_time_us = hold_time_us;
+        if (hold_time_us > handle->transport.max_buffer_hold_time_us) {
+            handle->transport.max_buffer_hold_time_us = hold_time_us;
         }
+        handle->snapshot_result.buffer_hold_time_us = hold_time_us;
         handle->processing_frame = false;
 
-        if (log_first_analysis) {
-            hm01b0_capture_log_first_analysis(&first_sample);
-        }
-        if (notify_snapshot_ready && frame_returned) {
+        if (snapshot_ready && frame_returned) {
+            const hm01b0_frame_rect_t crop = handle->snapshot_request.crop;
             ESP_LOGI(TAG,
                      "snapshot ready: frame=%" PRIu32
                      " crop=(%u,%u %ux%u), bytes=%u, copy=%" PRIu32
                      "us, buffer_hold=%" PRIu32 "us",
-                     handle->stats.snapshot_sequence,
-                     (unsigned)handle->config.snapshot_x,
-                     (unsigned)handle->config.snapshot_y,
-                     (unsigned)handle->config.snapshot_width,
-                     (unsigned)handle->config.snapshot_height,
-                     (unsigned)handle->stats.snapshot_size,
-                     handle->stats.snapshot_copy_time_us,
-                     handle->stats.last_buffer_hold_time_us);
-            handle->config.on_snapshot_ready(
-                handle->config.snapshot_buffer,
-                handle->config.snapshot_width,
-                handle->config.snapshot_height,
-                handle->stats.snapshot_sequence,
-                handle->config.snapshot_user_data);
-        } else if (notify_snapshot_ready) {
+                     handle->snapshot_result.sequence,
+                     (unsigned)crop.x, (unsigned)crop.y,
+                     (unsigned)crop.width, (unsigned)crop.height,
+                     (unsigned)handle->snapshot_result.size,
+                     handle->snapshot_result.copy_time_us,
+                     handle->snapshot_result.buffer_hold_time_us);
+            handle->snapshot_request.on_ready(
+                &handle->snapshot_result,
+                handle->snapshot_request.user_data);
+        } else if (snapshot_ready) {
             ESP_LOGE(TAG,
-                     "snapshot frame was not returned to the free queue; "
-                     "display notification suppressed");
+                     "snapshot Camera buffer was not returned; notification "
+                     "suppressed");
         }
 
         const int64_t now_us = esp_timer_get_time();
         if (now_us - handle->last_stats_time_us >=
-            (int64_t)handle->config.stats_period_ms * 1000LL) {
+            (int64_t)HM01B0_CAPTURE_STATS_PERIOD_MS * 1000LL) {
             hm01b0_capture_log_stats(handle, now_us);
         }
     }
@@ -1000,14 +610,13 @@ static void hm01b0_capture_log_memory(const hm01b0_capture_handle_t *handle)
              (unsigned)handle->dma_heap_free_after,
              (unsigned)handle->dma_heap_largest_after);
     ESP_LOGI(TAG,
-             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, "
-             "payload=%u bytes",
+             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, payload=%u bytes",
              handle->frames[0].data,
              esp_ptr_internal(handle->frames[0].data) ? "internal" : "external",
              handle->frames[1].data,
              esp_ptr_internal(handle->frames[1].data) ? "internal" : "external",
-             (unsigned)handle->stats.buffer_capacity,
-             (unsigned)handle->stats.payload_size);
+             (unsigned)handle->transport.buffer_capacity,
+             (unsigned)handle->transport.payload_size);
 }
 
 esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
@@ -1024,23 +633,6 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_NO_MEM, TAG,
                         "failed to allocate capture context");
     handle->config = *config;
-    if (handle->config.task_stack_size == 0U) {
-        handle->config.task_stack_size =
-            HM01B0_CAPTURE_DEFAULT_TASK_STACK_SIZE;
-    }
-    if (handle->config.task_priority == 0U) {
-        handle->config.task_priority = HM01B0_CAPTURE_DEFAULT_TASK_PRIORITY;
-    }
-    if (handle->config.stats_period_ms == 0U) {
-        handle->config.stats_period_ms =
-            HM01B0_CAPTURE_DEFAULT_STATS_PERIOD_MS;
-    }
-    if (handle->config.warmup_frames == 0U) {
-        handle->config.warmup_frames =
-            HM01B0_CAPTURE_DEFAULT_WARMUP_FRAMES;
-    }
-
-    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
 
     const esp_cam_ctlr_dvp_pin_config_t pin_config = {
         .data_width = CAM_CTLR_DATA_WIDTH_8,
@@ -1058,8 +650,8 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     const esp_cam_ctlr_dvp_config_t dvp_config = {
         .ctlr_id = 0,
         .clk_src = CAM_CLK_SRC_DEFAULT,
-        .h_res = config->raw_width,
-        .v_res = config->raw_height,
+        .h_res = config->frame_width,
+        .v_res = config->frame_height,
         .input_data_color_type = CAM_CTLR_COLOR_RAW8,
         .output_data_color_type = CAM_CTLR_COLOR_RAW8,
         .cam_data_width = 8U,
@@ -1080,44 +672,39 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         goto fail;
     }
 
-    ret = esp_cam_ctlr_get_frame_buffer_len(handle->cam_handle,
-                                             &handle->stats.buffer_capacity);
+    ret = esp_cam_ctlr_get_frame_buffer_len(
+        handle->cam_handle, &handle->transport.buffer_capacity);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to query DMA buffer length: %s",
                  esp_err_to_name(ret));
         goto fail;
     }
-
-    handle->stats.raw_width = config->raw_width;
-    handle->stats.raw_height = config->raw_height;
-    handle->stats.raw_stride = config->raw_width;
-    handle->stats.active_x = config->active_x;
-    handle->stats.active_y = config->active_y;
-    handle->stats.active_width = config->active_width;
-    handle->stats.active_height = config->active_height;
-    handle->stats.payload_size = (size_t)config->raw_width *
-                                 config->raw_height;
-    handle->stats.active_payload_size =
-        (size_t)config->active_width * config->active_height;
-    if (handle->stats.buffer_capacity < handle->stats.payload_size) {
+    handle->transport.frame_width = config->frame_width;
+    handle->transport.frame_height = config->frame_height;
+    handle->transport.frame_stride = config->frame_width;
+    handle->transport.payload_size = (size_t)config->frame_width *
+                                     config->frame_height;
+    if (handle->transport.buffer_capacity < handle->transport.payload_size) {
         ESP_LOGE(TAG, "driver buffer length is smaller than RAW8 payload");
         ret = ESP_ERR_INVALID_SIZE;
         goto fail;
     }
 
+    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
     handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
     handle->dma_heap_largest_before =
         heap_caps_get_largest_free_block(dma_caps);
 
     for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
         handle->frames[i].data = esp_cam_ctlr_alloc_buffer(
-            handle->cam_handle, handle->stats.buffer_capacity, dma_caps);
+            handle->cam_handle, handle->transport.buffer_capacity, dma_caps);
         if (handle->frames[i].data == NULL) {
             ESP_LOGE(TAG, "failed to allocate internal DMA Buffer %c",
                      (int)('A' + i));
             ret = ESP_ERR_NO_MEM;
             goto fail;
         }
+        handle->frames[i].capacity = handle->transport.buffer_capacity;
     }
 
     handle->dma_heap_free_after = heap_caps_get_free_size(dma_caps);
@@ -1135,12 +722,8 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         ret = ESP_ERR_NO_MEM;
         goto fail;
     }
-
-    ret = hm01b0_capture_reset_queues(handle);
-    if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to seed free queue");
-        goto fail;
-    }
+    ESP_GOTO_ON_ERROR(hm01b0_capture_reset_queues(handle), fail, TAG,
+                      "failed to seed free queue");
 
     const esp_cam_ctlr_evt_cbs_t callbacks = {
         .on_get_new_trans = hm01b0_capture_on_get_new_trans,
@@ -1155,44 +738,22 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     }
 
     if (xTaskCreate(hm01b0_capture_task, "hm01b0_frame",
-                    handle->config.task_stack_size, handle,
-                    (UBaseType_t)handle->config.task_priority,
+                    HM01B0_CAPTURE_TASK_STACK_SIZE, handle,
+                    HM01B0_CAPTURE_TASK_PRIORITY,
                     &handle->task_handle) != pdPASS) {
-        ESP_LOGE(TAG, "failed to create frame analysis task");
+        ESP_LOGE(TAG, "failed to create frame task");
         ret = ESP_ERR_NO_MEM;
         goto fail;
     }
 
     ESP_LOGI(TAG,
-             "DVP ready: RAW8 %ux%u, payload=%u, capacity=%u, "
-             "burst=%" PRIu32 ", buffers=2, backup=disabled",
-             config->raw_width, config->raw_height,
-             (unsigned)handle->stats.payload_size,
-             (unsigned)handle->stats.buffer_capacity,
+             "DVP ready: RAW8 %ux%u, payload=%u, capacity=%u, burst=%" PRIu32
+             ", buffers=2, backup=disabled",
+             config->frame_width, config->frame_height,
+             (unsigned)handle->transport.payload_size,
+             (unsigned)handle->transport.buffer_capacity,
              config->dma_burst_size);
-    ESP_LOGI(TAG,
-             "analysis area=(%u,%u %ux%u), active_payload=%u, warmup=%" PRIu32
-             ", pattern=%s; DMA still captures the complete raw frame "
-             "without cropping",
-             config->active_x, config->active_y,
-             config->active_width, config->active_height,
-             (unsigned)handle->stats.active_payload_size,
-             handle->config.warmup_frames,
-             hm01b0_capture_pattern_analysis_name(
-                 handle->config.pattern_analysis));
-    if (config->snapshot_buffer != NULL) {
-        ESP_LOGI(TAG,
-                 "one-shot snapshot: crop=(%u,%u %ux%u), buffer=%p, "
-                 "capacity=%u bytes",
-                 (unsigned)config->snapshot_x,
-                 (unsigned)config->snapshot_y,
-                 (unsigned)config->snapshot_width,
-                 (unsigned)config->snapshot_height,
-                 config->snapshot_buffer,
-                 (unsigned)config->snapshot_buffer_size);
-    }
     hm01b0_capture_log_memory(handle);
-
     *out_handle = handle;
     return ESP_OK;
 
@@ -1201,7 +762,70 @@ fail:
     return ret;
 }
 
-esp_err_t hm01b0_capture_start(hm01b0_capture_handle_t *handle)
+esp_err_t hm01b0_capture_set_diagnostics(
+    hm01b0_capture_handle_t *handle,
+    const hm01b0_diagnostic_config_t *config)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "capture handle is NULL");
+    ESP_RETURN_ON_FALSE(!handle->controller_started,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "stop Camera RX before changing diagnostics");
+    if (config == NULL || config->pattern == HM01B0_DIAGNOSTIC_PATTERN_NONE) {
+        handle->diagnostic_enabled = false;
+        handle->diagnostic_config = (hm01b0_diagnostic_config_t) {0};
+        return ESP_OK;
+    }
+    ESP_RETURN_ON_FALSE(
+        config->pattern == HM01B0_DIAGNOSTIC_PATTERN_WALKING_1 ||
+        config->pattern == HM01B0_DIAGNOSTIC_PATTERN_COLOR_BAR,
+        ESP_ERR_INVALID_ARG, TAG, "invalid diagnostic pattern");
+    ESP_RETURN_ON_FALSE(hm01b0_capture_rect_is_valid(handle, config->area),
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "diagnostic area is outside the frame");
+    handle->diagnostic_config = *config;
+    handle->diagnostic_enabled = true;
+    ESP_LOGI(TAG, "diagnostics configured: pattern=%s area=(%u,%u %ux%u) "
+                  "warmup=%" PRIu32,
+             hm01b0_diagnostic_pattern_name(config->pattern),
+             (unsigned)config->area.x, (unsigned)config->area.y,
+             (unsigned)config->area.width, (unsigned)config->area.height,
+             config->warmup_frames);
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_capture_request_snapshot(
+    hm01b0_capture_handle_t *handle,
+    const hm01b0_snapshot_request_t *request)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL && request != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid snapshot request");
+    ESP_RETURN_ON_FALSE(!handle->controller_started,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "stop Camera RX before requesting a snapshot");
+    ESP_RETURN_ON_FALSE(request->buffer != NULL && request->on_ready != NULL,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "snapshot buffer or callback is NULL");
+    ESP_RETURN_ON_FALSE(hm01b0_capture_rect_is_valid(handle, request->crop),
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "snapshot crop is outside the frame");
+    const size_t required = (size_t)request->crop.width * request->crop.height;
+    ESP_RETURN_ON_FALSE(request->buffer_size >= required,
+                        ESP_ERR_INVALID_SIZE, TAG,
+                        "snapshot buffer is too small");
+    handle->snapshot_request = *request;
+    handle->snapshot_pending = true;
+    handle->snapshot_result = (hm01b0_snapshot_result_t) {0};
+    ESP_LOGI(TAG,
+             "snapshot requested: crop=(%u,%u %ux%u), buffer=%p, bytes=%u, "
+             "skip=%" PRIu32,
+             (unsigned)request->crop.x, (unsigned)request->crop.y,
+             (unsigned)request->crop.width, (unsigned)request->crop.height,
+             request->buffer, (unsigned)required, request->skip_frames);
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_capture_rx_start(hm01b0_capture_handle_t *handle)
 {
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "capture handle is NULL");
@@ -1212,7 +836,7 @@ esp_err_t hm01b0_capture_start(hm01b0_capture_handle_t *handle)
                         ESP_ERR_INVALID_STATE, TAG,
                         "a frame is still being processed");
 
-    hm01b0_capture_reset_diagnostics(handle);
+    hm01b0_capture_reset_session(handle);
     ESP_RETURN_ON_ERROR(hm01b0_capture_reset_queues(handle), TAG,
                         "failed to prepare frame queues");
 
@@ -1236,7 +860,7 @@ esp_err_t hm01b0_capture_start(hm01b0_capture_handle_t *handle)
     return ESP_OK;
 }
 
-esp_err_t hm01b0_capture_stop(hm01b0_capture_handle_t *handle)
+esp_err_t hm01b0_capture_rx_stop(hm01b0_capture_handle_t *handle)
 {
     if (handle == NULL) {
         return ESP_OK;
@@ -1260,12 +884,13 @@ esp_err_t hm01b0_capture_stop(hm01b0_capture_handle_t *handle)
             handle->controller_enabled = false;
         }
     }
+
     if (result == ESP_OK && handle->free_queue != NULL &&
         handle->ready_queue != NULL) {
         const TickType_t wait_ticks = pdMS_TO_TICKS(10U);
         const uint32_t wait_count =
             HM01B0_CAPTURE_TASK_STOP_TIMEOUT_MS / 10U;
-        uint32_t i = 0;
+        uint32_t i = 0U;
         while ((handle->processing_frame ||
                 uxQueueMessagesWaiting(handle->ready_queue) != 0U) &&
                i < wait_count) {
@@ -1277,13 +902,14 @@ esp_err_t hm01b0_capture_stop(hm01b0_capture_handle_t *handle)
             ESP_LOGE(TAG, "timed out waiting for frame task to become idle");
             result = ESP_ERR_TIMEOUT;
         } else {
-            const esp_err_t ret = hm01b0_capture_reset_queues(handle);
-            if (ret != ESP_OK) {
-                result = ret;
-            }
+            result = hm01b0_capture_reset_queues(handle);
         }
     }
     if (result == ESP_OK) {
+        if (handle->free_queue != NULL && handle->ready_queue != NULL &&
+            handle->last_stats_time_us != 0) {
+            hm01b0_capture_log_stats(handle, esp_timer_get_time());
+        }
         ESP_LOGI(TAG, "Camera RX stopped and disabled");
     }
     return result;
@@ -1295,11 +921,10 @@ esp_err_t hm01b0_capture_delete(hm01b0_capture_handle_t *handle)
         return ESP_OK;
     }
 
-    esp_err_t result = hm01b0_capture_stop(handle);
+    esp_err_t result = hm01b0_capture_rx_stop(handle);
     if (handle->controller_started || handle->controller_enabled) {
-        ESP_LOGE(TAG,
-                 "capture resources remain owned because Camera RX could not "
-                 "be stopped safely");
+        ESP_LOGE(TAG, "capture resources remain owned because Camera RX "
+                      "could not be stopped safely");
         return result == ESP_OK ? ESP_ERR_INVALID_STATE : result;
     }
 
@@ -1319,12 +944,9 @@ esp_err_t hm01b0_capture_delete(hm01b0_capture_handle_t *handle)
         if (result == ESP_OK) {
             result = ret;
         }
-        handle->cam_handle = NULL;
     }
-
     for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
         heap_caps_free(handle->frames[i].data);
-        handle->frames[i].data = NULL;
     }
     if (handle->free_queue != NULL) {
         vQueueDelete(handle->free_queue);
@@ -1336,16 +958,40 @@ esp_err_t hm01b0_capture_delete(hm01b0_capture_handle_t *handle)
     return result;
 }
 
-esp_err_t hm01b0_capture_get_stats(const hm01b0_capture_handle_t *handle,
-                                   hm01b0_capture_stats_t *stats)
+esp_err_t hm01b0_capture_get_transport_stats(
+    const hm01b0_capture_handle_t *handle,
+    hm01b0_capture_transport_stats_t *stats)
 {
     ESP_RETURN_ON_FALSE(handle != NULL && stats != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
-    *stats = handle->stats;
+    *stats = handle->transport;
     stats->frames_received = handle->isr_frames_received;
     stats->no_free_buffer = handle->isr_no_free_buffer;
     stats->ready_queue_overflows = handle->isr_ready_queue_overflows;
     stats->free_queue_errors = handle->isr_free_queue_errors +
                                handle->task_free_queue_errors;
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_capture_get_diagnostic_report(
+    const hm01b0_capture_handle_t *handle,
+    hm01b0_diagnostic_report_t *report)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL && report != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+    *report = handle->diagnostic_report;
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_capture_get_snapshot_result(
+    const hm01b0_capture_handle_t *handle,
+    hm01b0_snapshot_result_t *result)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL && result != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+    ESP_RETURN_ON_FALSE(handle->snapshot_result.size > 0U,
+                        ESP_ERR_NOT_FOUND, TAG,
+                        "no completed snapshot is available");
+    *result = handle->snapshot_result;
     return ESP_OK;
 }
