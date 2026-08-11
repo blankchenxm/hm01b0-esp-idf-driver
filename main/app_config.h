@@ -23,10 +23,10 @@
 #define APP_DISPLAY_CROP_WIDTH  240U
 #define APP_DISPLAY_CROP_HEIGHT 240U
 
-/* SPI ST7789 configuration used by the esp_lcd transport. */
+/* Stage 5 FPS experiment: validate the ST7789 and wiring at 80 MHz. */
 #define APP_ST7789_WIDTH          240U
 #define APP_ST7789_HEIGHT         240U
-#define APP_ST7789_CLOCK_HZ  40000000U
+#define APP_ST7789_CLOCK_HZ  80000000U
 
 /* Real-image streaming policy after both startup preflights. */
 #define APP_STREAM_WARMUP_FRAMES    5U
