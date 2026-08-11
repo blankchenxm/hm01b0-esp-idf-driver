@@ -66,6 +66,9 @@ struct hm01b0_capture {
     hm01b0_snapshot_result_t snapshot_result;
     bool snapshot_pending;
 
+    hm01b0_capture_frame_consumer_t frame_consumer;
+    void *frame_consumer_user_data;
+
     int64_t last_stats_time_us;
     uint32_t last_stats_frame_count;
     int64_t last_error_log_time_us;
@@ -545,6 +548,10 @@ static void hm01b0_capture_task(void *arg)
         if (size_valid) {
             hm01b0_capture_process_diagnostics(handle, frame);
             snapshot_ready = hm01b0_capture_process_snapshot(handle, frame);
+            if (handle->frame_consumer != NULL) {
+                handle->frame_consumer(
+                    frame, handle->frame_consumer_user_data);
+            }
         }
 
         const uint32_t processing_time_us = (uint32_t)(
@@ -824,6 +831,26 @@ esp_err_t hm01b0_capture_request_snapshot(
              (unsigned)request->crop.x, (unsigned)request->crop.y,
              (unsigned)request->crop.width, (unsigned)request->crop.height,
              request->buffer, (unsigned)required, request->skip_frames);
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_capture_set_frame_consumer(
+    hm01b0_capture_handle_t *handle,
+    hm01b0_capture_frame_consumer_t consumer,
+    void *user_data)
+{
+    ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "capture handle is NULL");
+    ESP_RETURN_ON_FALSE(!handle->controller_started,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "stop Camera RX before changing frame consumer");
+    ESP_RETURN_ON_FALSE(!handle->processing_frame,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "a frame is still being processed");
+    handle->frame_consumer = consumer;
+    handle->frame_consumer_user_data = user_data;
+    ESP_LOGI(TAG, "live frame consumer %s",
+             consumer != NULL ? "enabled" : "disabled");
     return ESP_OK;
 }
 

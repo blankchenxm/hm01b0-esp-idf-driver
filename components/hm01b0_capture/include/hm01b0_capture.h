@@ -79,6 +79,15 @@ typedef struct {
     void *user_data;
 } hm01b0_snapshot_request_t;
 
+/**
+ * Optional valid-frame consumer invoked by the capture task, never by the
+ * Camera ISR. The frame pointer and pixel data are borrowed and remain valid
+ * only until the callback returns.
+ */
+typedef void (*hm01b0_capture_frame_consumer_t)(
+    const hm01b0_capture_frame_t *frame,
+    void *user_data);
+
 /** Create DVP, two internal DMA buffers, queues, and the frame task. */
 esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
                              hm01b0_capture_handle_t **out_handle);
@@ -92,6 +101,12 @@ esp_err_t hm01b0_capture_set_diagnostics(
 esp_err_t hm01b0_capture_request_snapshot(
     hm01b0_capture_handle_t *handle,
     const hm01b0_snapshot_request_t *request);
+
+/** Configure an optional live-frame consumer while Camera RX is stopped. */
+esp_err_t hm01b0_capture_set_frame_consumer(
+    hm01b0_capture_handle_t *handle,
+    hm01b0_capture_frame_consumer_t consumer,
+    void *user_data);
 
 /** Enable/start the ESP32-S3 Camera receiver. Start sensor streaming next. */
 esp_err_t hm01b0_capture_rx_start(hm01b0_capture_handle_t *handle);
