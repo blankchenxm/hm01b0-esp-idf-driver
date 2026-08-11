@@ -35,6 +35,7 @@ static spi_device_handle_t spi_handle = NULL;
 
 // MADCTL参数
 #define MADCTL_RGB 0x00
+#define ST7789_MAX_TRANSFER_SIZE 1024
 
 // =======================================================
 // 底层SPI发送函数
@@ -93,7 +94,12 @@ esp_err_t st7789_init(void)
         .pull_down_en = GPIO_PULLDOWN_DISABLE,
         .intr_type = GPIO_INTR_DISABLE,
     };
-    gpio_config(&io_conf);
+    esp_err_t ret = gpio_config(&io_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to configure control GPIOs: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
 
     // 配置SPI总线
     spi_bus_config_t bus_cfg = {
@@ -102,9 +108,14 @@ esp_err_t st7789_init(void)
         .sclk_io_num = ST7789_PIN_SCL,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = ST7789_WIDTH * ST7789_HEIGHT * 2 + 8,
+        .max_transfer_sz = ST7789_MAX_TRANSFER_SIZE,
     };
-    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO));
+    ret = spi_bus_initialize(SPI2_HOST, &bus_cfg, SPI_DMA_CH_AUTO);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to initialize SPI bus: %s",
+                 esp_err_to_name(ret));
+        return ret;
+    }
 
     // 配置SPI设备
     spi_device_interface_config_t dev_cfg = {
@@ -114,7 +125,12 @@ esp_err_t st7789_init(void)
         .queue_size = 7,
         .flags = SPI_DEVICE_NO_DUMMY,
     };
-    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle));
+    ret = spi_bus_add_device(SPI2_HOST, &dev_cfg, &spi_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to add SPI device: %s", esp_err_to_name(ret));
+        (void)spi_bus_free(SPI2_HOST);
+        return ret;
+    }
 
     // 硬件复位
     st7789_hw_reset();

@@ -788,7 +788,7 @@ hm01b0_stop(sensor)
 | `hm01b0_capture_task()` | 持续运行的 FreeRTOS Task |
 | `hm01b0_capture_process_frame()` | 每个从 ready_queue 取出的帧 |
 | `hm01b0_capture_active_crc()` | warm-up 后逐行计算 320x244 active CRC |
-| `hm01b0_select_walking_sample_rows()` | 选择 active 顶部两行、中间行和最后一行 |
+| `hm01b0_select_pattern_sample_rows()` | 选择 active 顶部两行、中间行和最后一行 |
 | `hm01b0_analyze_walking_one()` | warm-up 后只观察四条代表行的结构和值分布 |
 | `hm01b0_is_one_hot()` | Walking-1 值分类，不再作为整帧硬性判错条件 |
 | `hm01b0_capture_take_analysis_sample()` | 归还 DMA Buffer 前复制五组 32-byte 小样本 |
@@ -799,5 +799,7 @@ hm01b0_stop(sensor)
 | `hm01b0_capture_delete()` | 构造/启动错误或未来正常关闭 |
 | `hm01b0_capture_get_stats()` | 公开 API，当前 `main.c` 未调用 |
 
-`main/st7789_display.c` 当前没有加入 `main/CMakeLists.txt` 的 `SRCS`，因此
-其中的显示函数不属于阶段 1～3 的实际执行路径。
+本文件只记录阶段 1～3 的基线执行路径；当时
+`main/st7789_display.c` 尚未加入构建。Stage 4 已将它加入
+`main/CMakeLists.txt`，并增加可选 Walking-1/Color-Bar 内容分析；新增的
+静态帧路径见 `stage4_todo.md`。
