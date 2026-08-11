@@ -2,6 +2,8 @@ idf_component_register(
     SRCS
         "hm01b0_capture.c"
         "hm01b0_cache_compat.c"
+        "hm01b0_diagnostics.c"
+        "hm01b0_frame_ops.c"
     INCLUDE_DIRS
         "include"
     REQUIRES

@@ -39,6 +39,21 @@ typedef enum {
 } hm01b0_test_pattern_t;
 
 typedef struct {
+    uint16_t x;
+    uint16_t y;
+    uint16_t width;
+    uint16_t height;
+} hm01b0_rect_t;
+
+/** Geometry produced on the DVP bus for one sensor mode. */
+typedef struct {
+    uint16_t transport_width;
+    uint16_t transport_height;
+    hm01b0_rect_t sensor_valid;
+    hm01b0_rect_t standard;
+} hm01b0_mode_info_t;
+
+typedef struct {
     uint16_t addr;
     uint8_t value;
     uint8_t mask;

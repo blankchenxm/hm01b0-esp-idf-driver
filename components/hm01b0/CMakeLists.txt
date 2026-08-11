@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         "hm01b0.c"
+        "hm01b0_mode_info.c"
         "hm01b0_modes.c"
         "hm01b0_reg.c"
         "hm01b0_sensor.c"
