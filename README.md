@@ -21,7 +21,7 @@ ST7789 driver and one complete internal-DMA RGB565 display Buffer.
 | 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and selectable test-pattern observation |
 | 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 | 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
-| 5. Real-image display | Implemented, build/hardware validation pending | `esp_lcd` ST7789, one 115,200-byte RGB565 DMA Buffer, non-blocking QVGA live display |
+| 5. Real-image display | Complete at QVGA 30 FPS | Hardware-validated `esp_lcd` ST7789, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
 
 The current sample initializes the sensor, capture controller, two Camera DMA
 buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
@@ -33,6 +33,14 @@ sensor test pattern, switches the shared display workspace to RGB565 use, and
 starts continuous real-image streaming. Display work uses a centered 240 x 240
 crop and is dropped rather than blocking Camera Buffer recycling when SPI DMA is
 still busy.
+
+The Stage 5 30 FPS baseline has been built, flashed, and exercised on hardware.
+After both preflights passed, real-image capture remained at approximately
+30.006 FPS and display throughput reached approximately 29.990 FPS for more
+than 1,200 frames. The observed run reported zero Camera size errors, Buffer
+starvation, ready-queue overflows, Buffer-return errors, busy display drops, and
+LCD submission errors. Higher sensor frame rates and higher LCD SPI clocks are
+separate follow-up experiments and do not change this validated baseline.
 
 ## Initial sensor configuration
 

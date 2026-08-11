@@ -58,20 +58,41 @@ initialize sensor and esp_lcd ST7789
 - One complete RGB565 display Buffer. A busy Buffer drops display work without
   reducing Camera transport ownership correctness.
 
-## Owner validation required
+## Owner validation completed
 
-- [ ] Build with the owner's ESP-IDF 6.0 environment.
-- [ ] Flash and confirm Walking-1 displays for about three seconds.
-- [ ] Confirm Color-Bar then displays for about three seconds.
-- [ ] Confirm the log switches the shared workspace from 57,600-byte RAW8 use
+- [x] Build with the owner's ESP-IDF 6.0 environment.
+- [x] Flash and confirm Walking-1 displays for about three seconds.
+- [x] Confirm Color-Bar then displays for about three seconds.
+- [x] Confirm the log switches the shared workspace from 57,600-byte RAW8 use
   to 115,200-byte RGB565 use.
-- [ ] Confirm Test Pattern is OFF before real-image streaming starts.
-- [ ] Confirm a live centered grayscale image continuously appears.
-- [ ] Confirm `received_size=79056`, `size_err=0`, `no_buffer=0`,
+- [x] Confirm Test Pattern is OFF before real-image streaming starts.
+- [x] Confirm a live centered grayscale image continuously appears.
+- [x] Confirm `received_size=79056`, `size_err=0`, `no_buffer=0`,
   `ready_overflow=0`, and `free_err=0`.
-- [ ] Record Camera FPS, display FPS, conversion time, submit time, DMA time,
+- [x] Record Camera FPS, display FPS, conversion time, submit time, DMA time,
   and `dropped_busy`.
-- [ ] Confirm there is no mixed-frame corruption when display frames drop.
+- [x] Confirm continuous display without mixed-frame corruption; no display
+  frames dropped during this validation run.
+
+## Validated 30 FPS baseline
+
+Owner hardware validation on 2026-08-11 established the following baseline:
+
+- Walking-1 transport/content preflight: PASS, 178/178 valid frames.
+- Color-Bar transport/content preflight: PASS, 176/176 valid frames.
+- Real-image Camera transport: approximately 30.006 FPS.
+- ST7789 display throughput: approximately 29.990 FPS.
+- Sustained observation: more than 1,200 valid Camera frames.
+- Display timing maxima: 7,623 us conversion, 20,130 us draw-call return,
+  and 23,503 us from draw request to completion callback.
+- Capture timing maxima: 28,206 us processing and 28,209 us Camera Buffer hold.
+- Error counters remained zero: `size_err`, `no_buffer`, `ready_overflow`,
+  `free_err`, `dropped_busy`, and `submit_err`.
+
+The reported `dma` interval starts immediately before
+`esp_lcd_panel_draw_bitmap()` and ends in the color-transfer completion
+callback. It therefore includes the measured draw-call interval and must not be
+added to `submit` when calculating end-to-end latency.
 
 ## Deferred
 
