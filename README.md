@@ -55,9 +55,16 @@ separate follow-up experiments and do not change this validated baseline.
 | MCLK | 12 MHz external clock |
 | Sensor_Core | MCLK / 2 = 6 MHz |
 | Sensor_Register | MCLK / 1 = 12 MHz |
-| Frame timing | 376 PCK x 532 lines, approximately 30 FPS |
+| Frame timing | Current experiment: 376 PCK x 266 lines, approximately 60 FPS; validated baseline: 376 x 532, approximately 30 FPS |
 | I2C address | `0x24` (7-bit) |
 | Expected model ID | `0x01B0` |
+
+The application selects frame rate in `main/app_config.h` through
+`APP_HM01B0_FRAME_RATE`. Public presets are 15, 20, 30, 45, 60, and 120 FPS;
+the driver rejects combinations that exceed the current mode or cannot be
+reached with the selected MCLK/interface divider. `hm01b0_set_frame_rate()`
+keeps the mode's datasheet minimum line length, calculates frame length, and
+updates `MAX_INTEGRATION` to `FRAME_LENGTH_LINES - 2` while in standby.
 
 ## Stage 3 first capture configuration
 
@@ -215,6 +222,8 @@ esp_err_t hm01b0_reset(hm01b0_handle_t *dev);
 esp_err_t hm01b0_standby(hm01b0_handle_t *dev);
 esp_err_t hm01b0_stream_start(hm01b0_handle_t *dev);
 esp_err_t hm01b0_stream_stop(hm01b0_handle_t *dev);
+esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
+                                hm01b0_frame_rate_t frame_rate);
 esp_err_t hm01b0_get_mode_info(hm01b0_mode_t mode,
                                hm01b0_mode_info_t *info);
 ```

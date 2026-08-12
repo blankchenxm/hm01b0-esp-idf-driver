@@ -114,12 +114,31 @@ remains an exact rollback point.
   maxima against the validated 40 MHz baseline.
 - [ ] Confirm all Camera and display error counters remain zero.
 
-This first experiment deliberately leaves the HM01B0 at approximately 30 FPS.
-It measures display-path headroom before changing sensor frame timing.
+The 80 MHz/LUT step first measured display-path headroom at the validated
+30 FPS sensor timing. The next step uses that headroom for a QVGA 60 FPS
+sensor-timing experiment.
+
+## FPS experiment 2: QVGA 60 FPS sensor timing
+
+- [x] Add public 15/20/30/45/60/120 FPS preset types.
+- [x] Add `hm01b0_set_frame_rate()` and require standby configuration.
+- [x] Derive Sensor_Core from MCLK and the selected interface divider.
+- [x] Enforce the datasheet minimum line/frame lengths and per-mode maximum
+  frame rate.
+- [x] Calculate `FRAME_LENGTH_LINES` without exceeding the requested FPS.
+- [x] Keep `MAX_INTEGRATION = FRAME_LENGTH_LINES - 2`.
+- [x] Select `HM01B0_FRAME_RATE_60` from `main/app_config.h`.
+- [x] For the current 12 MHz, /2, QVGA configuration, produce
+  `LINE_LENGTH_PCK=376`, `FRAME_LENGTH_LINES=266`, and
+  `MAX_INTEGRATION=264` (calculated 59.990 FPS).
+- [ ] Build and flash in the owner's ESP-IDF 6.0 environment.
+- [ ] Confirm both preflights run at approximately 60 FPS.
+- [ ] Confirm real-image Camera and display throughput approach 60 FPS.
+- [ ] Record `dropped_busy`, `no_buffer`, `ready_overflow`, and timing maxima.
+- [ ] Confirm the live image remains stable at 80 MHz SPI.
 
 ## Deferred
 
-- [ ] Higher HM01B0 sensor frame timing after the 80 MHz display experiment.
 - [ ] TE/vertical-blank synchronization and tearing control.
 - [ ] Full 320-to-240 horizontal downscaling.
 - [ ] A second complete RGB565 Buffer.
