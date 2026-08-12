@@ -487,8 +487,8 @@ esp_err_t st7789_display_prepare_stream(st7789_display_handle_t *display)
     display->preflight_line_size = 0U;
     display->stream_prepared = true;
     ESP_LOGI(TAG,
-             "RGB565 workspace switched from %u-byte RAW8 preflight use to "
-             "%u-byte full-frame SPI DMA use",
+             "RGB565 workspace ended RAW8 preflight use (capacity=%u bytes); "
+             "%u-byte workspace is ready for SPI DMA",
              (unsigned)((size_t)display->config.width * display->config.height),
              (unsigned)display->rgb_frame_size);
     st7789_display_reset_stats(display);

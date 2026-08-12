@@ -10,7 +10,8 @@ standby/streaming state machine. It also contains direct ESP32-S3 DVP capture
 with two internal DMA frame buffers. Stage 4.5 separates transport, diagnostics,
 frame operations, and display responsibilities and adds a two-pattern startup
 preflight. Stage 5 adds real-image streaming through the ESP-IDF `esp_lcd`
-ST7789 driver and one complete internal-DMA RGB565 display Buffer.
+ST7789 driver and one complete internal-DMA RGB565 display Buffer. Stage 6
+extends that same pipeline to Full, QVGA, and monochrome QQVGA modes.
 
 ## Current status
 
@@ -22,6 +23,7 @@ ST7789 driver and one complete internal-DMA RGB565 display Buffer.
 | 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 | 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
 | 5. Real-image display | Complete at QVGA 60 FPS | Hardware-validated 80 MHz `esp_lcd` ST7789, RGB565 lookup conversion, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
+| 6. Multi-mode display | Implementation complete; hardware validation pending | One mode-driven Full/QVGA/QQVGA flow, automatic crop/destination geometry, native QQVGA centered with black borders |
 
 The current sample initializes the sensor, capture controller, two Camera DMA
 buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
@@ -30,9 +32,9 @@ streaming, skips five frames, analyzes and snapshots one complete frame, and
 displays the static crop for three seconds while capture diagnostics continue.
 It then stops the sensor and Camera RX. The application finally disables the
 sensor test pattern, switches the shared display workspace to RGB565 use, and
-starts continuous real-image streaming. Display work uses a centered 240 x 240
-crop and is dropped rather than blocking Camera Buffer recycling when SPI DMA is
-still busy.
+starts continuous real-image streaming. Full and QVGA use centered 240 x 240
+crops; QQVGA remains 160 x 120 and is centered on the panel. Display work is
+dropped rather than blocking Camera Buffer recycling when SPI DMA is busy.
 
 Stage 5 has been built, flashed, and exercised on hardware at QVGA 60 FPS.
 After both preflights passed, real-image capture remained at approximately
@@ -64,6 +66,20 @@ the driver rejects combinations that exceed the current mode or cannot be
 reached with the selected MCLK/interface divider. `hm01b0_set_frame_rate()`
 keeps the mode's datasheet minimum line length, calculates frame length, and
 updates `MAX_INTEGRATION` to `FRAME_LENGTH_LINES - 2` while in standby.
+
+Stage 6 derives every application geometry value from the selected mode:
+
+| Mode | DVP transport | Standard area | Display source | LCD destination |
+|---|---:|---:|---:|---:|
+| Full | 324 x 324 | `(2,2 320x320)` | `(42,42 240x240)` | `(0,0)` |
+| QVGA | 324 x 244 | `(2,2 320x240)` | `(42,2 240x240)` | `(0,0)` |
+| QQVGA | 162 x 122 | `(1,1 160x120)` | `(1,1 160x120)` | `(40,60)` |
+
+The complete 115,200-byte RGB565 workspace is unchanged across modes. During
+preflight it temporarily stores a 57,600-byte Full/QVGA RAW8 Snapshot or a
+19,200-byte QQVGA Snapshot. Camera A/B always follow the uncropped DVP
+transport. See [stage6_todo.md](stage6_todo.md) for memory calculations,
+frame-rate limits, configuration examples, and the hardware checklist.
 
 ## Stage 3 first capture configuration
 
@@ -182,8 +198,9 @@ components/st7789_display/
 
 main/
   board_config.h           Sample board pin mapping
-  app_config.h             Stage 5 preflight and live-display policy
-  main.c                   Run preflights, then start real-image streaming
+  app_config.h             Mode, frame-rate, preflight, and display policy
+  app_mode_profile.c/.h    Derive capture/crop/destination mode geometry
+  main.c                   Run common preflights and selected-mode streaming
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
@@ -252,7 +269,7 @@ MODEL_ID_H=0x01, MODEL_ID_L=0xB0, MODEL_ID=0x01B0
 PASS: HM01B0 initialized in STANDBY
 ```
 
-Stage 5 reports the 324 x 244 geometry, aligned Buffer A/B allocations,
+Stage 6 reports the selected transport and display geometry, aligned Buffer A/B allocations,
 transport health, tagged Pattern observations, snapshot copy/hold timing, and
 one-time LCD transfer duration for each preflight. During real-image streaming
 it reports Camera and display FPS, RGB conversion/submission/DMA timing, and

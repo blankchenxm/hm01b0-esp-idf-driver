@@ -49,8 +49,9 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
 esp_err_t st7789_display_delete(st7789_display_handle_t *display);
 
 /**
- * Borrow the first half of the reserved RGB565 frame workspace as one packed
- * RAW8 preflight snapshot. The pointer remains owned by the display component.
+ * Borrow the first half of the reserved RGB565 frame workspace as packed RAW8
+ * preflight storage. A mode may use less than the returned capacity. The
+ * pointer remains owned by the display component.
  */
 esp_err_t st7789_display_get_preflight_buffer(
     st7789_display_handle_t *display,
@@ -77,10 +78,11 @@ esp_err_t st7789_display_prepare_stream(st7789_display_handle_t *display);
 /**
  * Non-blocking live-frame submission.
  *
- * The source is valid only for this call. Crop and RAW8-to-RGB565 conversion
- * finish before the function returns. ESP_ERR_TIMEOUT means the single RGB565
- * buffer is still owned by SPI DMA and this display frame was intentionally
- * dropped.
+ * The source is valid only for this call. The selected source rectangle is
+ * converted into the beginning of the RGB565 workspace and submitted to the
+ * requested panel destination. Conversion finishes before this function
+ * returns. ESP_ERR_TIMEOUT means the single RGB565 buffer is still owned by
+ * SPI DMA and this display frame was intentionally dropped.
  */
 esp_err_t st7789_display_try_draw_gray8_frame(
     st7789_display_handle_t *display,
