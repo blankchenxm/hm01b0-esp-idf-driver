@@ -1,3 +1,5 @@
+#include <inttypes.h>
+
 #include "esp_check.h"
 #include "esp_log.h"
 #include "esp_rom_sys.h"
@@ -7,8 +9,63 @@
 #include "hm01b0_tables.h"
 
 #define HM01B0_RESET_RECOVERY_US 1000U
+#define HM01B0_SENSOR_CORE_MAX_HZ 6000000U
 
 static const char *TAG = "hm01b0_sensor";
+
+typedef struct {
+    uint16_t min_line_length_pck;
+    uint16_t min_frame_length_lines;
+    uint16_t max_frame_rate;
+} hm01b0_timing_constraints_t;
+
+static esp_err_t hm01b0_get_timing_constraints(
+    hm01b0_mode_t mode,
+    hm01b0_timing_constraints_t *constraints)
+{
+    ESP_RETURN_ON_FALSE(constraints != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "timing constraints are NULL");
+
+    switch (mode) {
+    case HM01B0_SENSOR_MODE_FULL:
+        *constraints = (hm01b0_timing_constraints_t) {
+            .min_line_length_pck = 0x0178U,
+            .min_frame_length_lines = 0x0158U,
+            .max_frame_rate = 45U,
+        };
+        break;
+    case HM01B0_SENSOR_MODE_QVGA:
+        *constraints = (hm01b0_timing_constraints_t) {
+            .min_line_length_pck = 0x0178U,
+            .min_frame_length_lines = 0x0104U,
+            .max_frame_rate = 60U,
+        };
+        break;
+    case HM01B0_SENSOR_MODE_QQVGA:
+        *constraints = (hm01b0_timing_constraints_t) {
+            .min_line_length_pck = 0x00D7U,
+            .min_frame_length_lines = 0x0080U,
+            .max_frame_rate = 120U,
+        };
+        break;
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
+    return ESP_OK;
+}
+
+static uint32_t hm01b0_core_divider(hm01b0_interface_t interface)
+{
+    switch (interface) {
+    case HM01B0_DATA_INTERFACE_8_BIT:
+    case HM01B0_DATA_INTERFACE_4_BIT:
+        return 2U;
+    case HM01B0_DATA_INTERFACE_1_BIT:
+        return 8U;
+    default:
+        return 0U;
+    }
+}
 
 static esp_err_t hm01b0_require_standby(const hm01b0_handle_t *dev)
 {
@@ -140,6 +197,7 @@ esp_err_t hm01b0_set_mode(hm01b0_handle_t *dev, hm01b0_mode_t mode)
     ESP_RETURN_ON_ERROR(hm01b0_write_table(dev, table, count), TAG,
                         "failed to apply %s mode table", name);
     dev->mode = mode;
+    dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
     ESP_LOGI(TAG, "mode=%s", name);
     return ESP_OK;
 }
@@ -177,7 +235,128 @@ esp_err_t hm01b0_set_interface(hm01b0_handle_t *dev,
     ESP_RETURN_ON_ERROR(hm01b0_write_table(dev, table, count), TAG,
                         "failed to apply %s interface table", name);
     dev->interface = interface;
+    dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
     ESP_LOGI(TAG, "interface=%s", name);
+    return ESP_OK;
+}
+
+esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
+                                hm01b0_frame_rate_t frame_rate)
+{
+    ESP_RETURN_ON_ERROR(hm01b0_require_standby(dev), TAG,
+                        "cannot configure frame rate");
+
+    switch (frame_rate) {
+    case HM01B0_FRAME_RATE_15:
+    case HM01B0_FRAME_RATE_20:
+    case HM01B0_FRAME_RATE_30:
+    case HM01B0_FRAME_RATE_45:
+    case HM01B0_FRAME_RATE_60:
+    case HM01B0_FRAME_RATE_120:
+        break;
+    default:
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    hm01b0_timing_constraints_t constraints = {0};
+    ESP_RETURN_ON_ERROR(
+        hm01b0_get_timing_constraints(dev->mode, &constraints), TAG,
+        "failed to get timing constraints");
+
+    const uint32_t target_fps = (uint32_t)frame_rate;
+    ESP_RETURN_ON_FALSE(target_fps <= constraints.max_frame_rate,
+                        ESP_ERR_NOT_SUPPORTED, TAG,
+                        "%" PRIu32 " FPS exceeds mode maximum %u FPS",
+                        target_fps,
+                        (unsigned)constraints.max_frame_rate);
+
+    const uint32_t core_divider = hm01b0_core_divider(dev->interface);
+    ESP_RETURN_ON_FALSE(core_divider > 0U && dev->mclk_freq_hz > 0U,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "sensor clock/interface is not configured");
+    const uint32_t sensor_core_hz = dev->mclk_freq_hz / core_divider;
+    ESP_RETURN_ON_FALSE(
+        sensor_core_hz > 0U &&
+            sensor_core_hz <= HM01B0_SENSOR_CORE_MAX_HZ,
+        ESP_ERR_NOT_SUPPORTED, TAG,
+        "Sensor_Core=%" PRIu32 " Hz is outside supported range 1..%u Hz",
+        sensor_core_hz, (unsigned)HM01B0_SENSOR_CORE_MAX_HZ);
+
+    const uint16_t line_length_pck = constraints.min_line_length_pck;
+    const uint64_t frame_denominator =
+        (uint64_t)line_length_pck * target_fps;
+    const uint64_t calculated_frame_length =
+        ((uint64_t)sensor_core_hz + frame_denominator - 1U) /
+        frame_denominator;
+    ESP_RETURN_ON_FALSE(
+        calculated_frame_length >= constraints.min_frame_length_lines &&
+            calculated_frame_length <= UINT16_MAX,
+        ESP_ERR_NOT_SUPPORTED, TAG,
+        "%" PRIu32 " FPS cannot be reached: Sensor_Core=%" PRIu32
+        " Hz, required frame length=%" PRIu64 ", allowed=%u..%u",
+        target_fps, sensor_core_hz, calculated_frame_length,
+        (unsigned)constraints.min_frame_length_lines,
+        (unsigned)UINT16_MAX);
+
+    const uint16_t frame_length_lines =
+        (uint16_t)calculated_frame_length;
+    const uint16_t max_integration = frame_length_lines - 2U;
+    const hm01b0_regval_t timing_table[] = {
+        {
+            .addr = HM01B0_REG_LINE_LENGTH_PCK_H,
+            .value = (uint8_t)(line_length_pck >> 8U),
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+        {
+            .addr = HM01B0_REG_LINE_LENGTH_PCK_L,
+            .value = (uint8_t)line_length_pck,
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+        {
+            .addr = HM01B0_REG_FRAME_LENGTH_LINES_H,
+            .value = (uint8_t)(frame_length_lines >> 8U),
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+        {
+            .addr = HM01B0_REG_FRAME_LENGTH_LINES_L,
+            .value = (uint8_t)frame_length_lines,
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+        {
+            .addr = HM01B0_REG_MAX_INTEGRATION_H,
+            .value = (uint8_t)(max_integration >> 8U),
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+        {
+            .addr = HM01B0_REG_MAX_INTEGRATION_L,
+            .value = (uint8_t)max_integration,
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
+    };
+    ESP_RETURN_ON_ERROR(
+        hm01b0_write_table(dev, timing_table,
+                           sizeof(timing_table) / sizeof(timing_table[0])),
+        TAG, "failed to apply frame timing");
+
+    dev->frame_rate = frame_rate;
+    const uint32_t actual_fps_milli = (uint32_t)(
+        ((uint64_t)sensor_core_hz * 1000U) /
+        ((uint64_t)line_length_pck * frame_length_lines));
+    ESP_LOGI(TAG,
+             "frame_rate target=%" PRIu32 " FPS, calculated=%" PRIu32
+             ".%03" PRIu32 " FPS, Sensor_Core=%" PRIu32
+             " Hz, line_length=%u, frame_length=%u, max_integration=%u",
+             target_fps, actual_fps_milli / 1000U,
+             actual_fps_milli % 1000U, sensor_core_hz,
+             (unsigned)line_length_pck,
+             (unsigned)frame_length_lines,
+             (unsigned)max_integration);
     return ESP_OK;
 }
 

@@ -16,6 +16,21 @@
 
 static const char *TAG = "hm01b0";
 
+static bool hm01b0_valid_frame_rate(hm01b0_frame_rate_t frame_rate)
+{
+    switch (frame_rate) {
+    case HM01B0_FRAME_RATE_15:
+    case HM01B0_FRAME_RATE_20:
+    case HM01B0_FRAME_RATE_30:
+    case HM01B0_FRAME_RATE_45:
+    case HM01B0_FRAME_RATE_60:
+    case HM01B0_FRAME_RATE_120:
+        return true;
+    default:
+        return false;
+    }
+}
+
 static esp_err_t hm01b0_start_mclk(hm01b0_handle_t *dev,
                                    gpio_num_t gpio,
                                    uint32_t frequency_hz)
@@ -73,6 +88,7 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
                         config->initial_mode <= HM01B0_SENSOR_MODE_QQVGA &&
                         config->data_interface >= HM01B0_DATA_INTERFACE_8_BIT &&
                         config->data_interface <= HM01B0_DATA_INTERFACE_1_BIT &&
+                        hm01b0_valid_frame_rate(config->frame_rate) &&
                         config->test_pattern >= HM01B0_TEST_PATTERN_OFF &&
                         config->test_pattern <= HM01B0_TEST_PATTERN_WALKING_1,
                         ESP_ERR_INVALID_ARG, TAG, "invalid HM01B0 configuration");
@@ -85,7 +101,9 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
     dev->mclk_speed_mode = LEDC_LOW_SPEED_MODE;
     dev->mclk_timer = LEDC_TIMER_0;
     dev->mclk_channel = LEDC_CHANNEL_0;
+    dev->mclk_freq_hz = config->mclk_freq_hz;
     dev->state = HM01B0_STATE_UNINITIALIZED;
+    dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
 
     esp_err_t ret = hm01b0_start_mclk(dev, config->mclk_gpio,
                                       config->mclk_freq_hz);
@@ -164,6 +182,11 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
     }
 
     ret = hm01b0_set_interface(dev, config->data_interface);
+    if (ret != ESP_OK) {
+        goto initialization_failed;
+    }
+
+    ret = hm01b0_set_frame_rate(dev, config->frame_rate);
     if (ret != ESP_OK) {
         goto initialization_failed;
     }

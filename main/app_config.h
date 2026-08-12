@@ -8,6 +8,8 @@
 #define APP_HM01B0_I2C_FREQUENCY_HZ    100000U
 #define APP_HM01B0_MODE HM01B0_SENSOR_MODE_QVGA
 #define APP_HM01B0_INTERFACE HM01B0_DATA_INTERFACE_8_BIT
+/* Presets: 15/20/30/45/60 FPS; 120 FPS is QQVGA-only. */
+#define APP_HM01B0_FRAME_RATE HM01B0_FRAME_RATE_60
 
 /* DVP transport tuning remains the validated Stage 3 configuration. */
 #define APP_CAPTURE_DMA_BURST_SIZE 64U

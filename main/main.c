@@ -356,6 +356,7 @@ void app_main(void)
         .enable_internal_i2c_pullups = true,
         .initial_mode = APP_HM01B0_MODE,
         .data_interface = APP_HM01B0_INTERFACE,
+        .frame_rate = APP_HM01B0_FRAME_RATE,
         .test_pattern = HM01B0_TEST_PATTERN_OFF,
     };
     ret = hm01b0_new(&sensor_config, &s_sensor);
