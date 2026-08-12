@@ -60,7 +60,13 @@ struct hm01b0_capture {
     bool diagnostic_baseline_valid;
     uint32_t diagnostic_baseline_raw_crc;
     uint32_t diagnostic_baseline_active_crc;
-    bool first_diagnostic_logged;
+    bool first_diagnostic_sample_valid;
+    uint32_t first_diagnostic_sequence;
+    size_t first_diagnostic_received_size;
+    uint16_t first_diagnostic_raw_count;
+    uint16_t first_diagnostic_active_count;
+    uint8_t first_diagnostic_raw[HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
+    uint8_t first_diagnostic_active[HM01B0_CAPTURE_FIRST_SAMPLE_SIZE];
 
     hm01b0_snapshot_request_t snapshot_request;
     hm01b0_snapshot_result_t snapshot_result;
@@ -176,7 +182,11 @@ static void hm01b0_capture_reset_session(hm01b0_capture_handle_t *handle)
     handle->processed_frames = 0U;
     handle->baseline_received_size_valid = false;
     handle->diagnostic_baseline_valid = false;
-    handle->first_diagnostic_logged = false;
+    handle->first_diagnostic_sample_valid = false;
+    handle->first_diagnostic_sequence = 0U;
+    handle->first_diagnostic_received_size = 0U;
+    handle->first_diagnostic_raw_count = 0U;
+    handle->first_diagnostic_active_count = 0U;
     handle->last_error_log_time_us = 0;
     handle->last_stats_time_us = esp_timer_get_time();
     handle->last_stats_frame_count = 0U;
@@ -364,11 +374,13 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
              handle->transport.max_buffer_hold_time_us,
              (unsigned)uxQueueMessagesWaiting(handle->free_queue),
              (unsigned)uxQueueMessagesWaiting(handle->ready_queue));
-    hm01b0_capture_log_diagnostic(&handle->diagnostic_report);
+    if (!handle->controller_started) {
+        hm01b0_capture_log_diagnostic(&handle->diagnostic_report);
+    }
 }
 
-static void hm01b0_capture_log_first_sample(
-    const hm01b0_capture_handle_t *handle,
+static void hm01b0_capture_save_first_sample(
+    hm01b0_capture_handle_t *handle,
     const hm01b0_capture_frame_t *frame)
 {
     const size_t raw_count =
@@ -384,18 +396,41 @@ static void hm01b0_capture_log_first_sample(
             handle->config.frame_width +
         handle->diagnostic_config.area.x;
 
+    memcpy(handle->first_diagnostic_raw, frame->data, raw_count);
+    memcpy(handle->first_diagnostic_active,
+           frame->data + active_offset, active_count);
+    handle->first_diagnostic_sequence = frame->sequence;
+    handle->first_diagnostic_received_size = frame->received_size;
+    handle->first_diagnostic_raw_count = (uint16_t)raw_count;
+    handle->first_diagnostic_active_count = (uint16_t)active_count;
+    handle->first_diagnostic_sample_valid = true;
+}
+
+static void hm01b0_capture_log_saved_first_sample(
+    const hm01b0_capture_handle_t *handle)
+{
+    if (!handle->first_diagnostic_sample_valid) {
+        return;
+    }
+
     ESP_LOGI(TAG,
-             "first diagnostic frame=%" PRIu32 " received=%u",
-             frame->sequence, (unsigned)frame->received_size);
-    ESP_LOGI(TAG, "raw row y=0 x=0..%u", (unsigned)(raw_count - 1U));
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame->data, raw_count, ESP_LOG_INFO);
+             "saved first diagnostic frame=%" PRIu32 " received=%u; "
+             "printed after Camera RX stopped",
+             handle->first_diagnostic_sequence,
+             (unsigned)handle->first_diagnostic_received_size);
+    ESP_LOGI(TAG, "raw row y=0 x=0..%u",
+             (unsigned)(handle->first_diagnostic_raw_count - 1U));
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, handle->first_diagnostic_raw,
+                             handle->first_diagnostic_raw_count,
+                             ESP_LOG_INFO);
     ESP_LOGI(TAG, "analysis row y=%u x=%u..%u",
              (unsigned)handle->diagnostic_config.area.y,
              (unsigned)handle->diagnostic_config.area.x,
              (unsigned)(handle->diagnostic_config.area.x +
-                        active_count - 1U));
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, frame->data + active_offset,
-                             active_count, ESP_LOG_INFO);
+                        handle->first_diagnostic_active_count - 1U));
+    ESP_LOG_BUFFER_HEX_LEVEL(TAG, handle->first_diagnostic_active,
+                             handle->first_diagnostic_active_count,
+                             ESP_LOG_INFO);
 }
 
 static void hm01b0_capture_process_transport(
@@ -441,6 +476,14 @@ static void hm01b0_capture_process_diagnostics(
         return;
     }
 
+    const uint32_t post_warmup_index =
+        handle->processed_frames -
+        handle->diagnostic_config.warmup_frames - 1U;
+    if (post_warmup_index %
+            handle->diagnostic_config.sample_interval_frames != 0U) {
+        return;
+    }
+
     if (hm01b0_diagnostics_analyze_frame(
             handle->diagnostic_config.pattern,
             frame->data,
@@ -470,12 +513,8 @@ static void hm01b0_capture_process_diagnostics(
         }
     }
 
-    if (!handle->first_diagnostic_logged) {
-        ESP_LOGI(TAG, "warm-up complete: skipped=%" PRIu32 " frames",
-                 handle->diagnostic_report.warmup_frames);
-        hm01b0_capture_log_first_sample(handle, frame);
-        hm01b0_capture_log_diagnostic(&handle->diagnostic_report);
-        handle->first_diagnostic_logged = true;
+    if (!handle->first_diagnostic_sample_valid) {
+        hm01b0_capture_save_first_sample(handle, frame);
     }
 }
 
@@ -792,14 +831,17 @@ esp_err_t hm01b0_capture_set_diagnostics(
     ESP_RETURN_ON_FALSE(hm01b0_capture_rect_is_valid(handle, config->area),
                         ESP_ERR_INVALID_ARG, TAG,
                         "diagnostic area is outside the frame");
+    ESP_RETURN_ON_FALSE(config->sample_interval_frames > 0U,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "diagnostic sample interval must be greater than 0");
     handle->diagnostic_config = *config;
     handle->diagnostic_enabled = true;
     ESP_LOGI(TAG, "diagnostics configured: pattern=%s area=(%u,%u %ux%u) "
-                  "warmup=%" PRIu32,
+                  "warmup=%" PRIu32 " sample_interval=%" PRIu32,
              hm01b0_diagnostic_pattern_name(config->pattern),
              (unsigned)config->area.x, (unsigned)config->area.y,
              (unsigned)config->area.width, (unsigned)config->area.height,
-             config->warmup_frames);
+             config->warmup_frames, config->sample_interval_frames);
     return ESP_OK;
 }
 
@@ -939,6 +981,7 @@ esp_err_t hm01b0_capture_rx_stop(hm01b0_capture_handle_t *handle)
             handle->last_stats_time_us != 0) {
             hm01b0_capture_log_stats(handle, esp_timer_get_time());
         }
+        hm01b0_capture_log_saved_first_sample(handle);
         ESP_LOGI(TAG, "Camera RX stopped and disabled");
     }
     return result;

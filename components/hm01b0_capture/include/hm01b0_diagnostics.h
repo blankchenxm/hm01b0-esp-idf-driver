@@ -31,6 +31,8 @@ typedef struct {
     hm01b0_diagnostic_pattern_t pattern;
     hm01b0_frame_rect_t area;
     uint32_t warmup_frames;
+    /** Analyze the first post-warmup frame, then every N frames. */
+    uint32_t sample_interval_frames;
 } hm01b0_diagnostic_config_t;
 
 typedef struct {
