@@ -9,7 +9,8 @@ register tables, operating modes, interface configuration, test patterns, and a
 standby/streaming state machine. It also contains direct ESP32-S3 DVP capture
 with two internal DMA frame buffers. Stage 4.5 separates transport, diagnostics,
 frame operations, and display responsibilities and adds a two-pattern startup
-preflight before real-image streaming is introduced.
+preflight. Stage 5 adds real-image streaming through the ESP-IDF `esp_lcd`
+ST7789 driver and one complete internal-DMA RGB565 display Buffer.
 
 ## Current status
 
@@ -19,15 +20,27 @@ preflight before real-image streaming is introduced.
 | 2. Register tables + state machine | Complete | Common initialization, FULL/QVGA/QQVGA modes, 8/4/1-bit interfaces, test patterns, standby/start/stop |
 | 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and selectable test-pattern observation |
 | 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
-| 4.5. Pre-streaming architecture | Implemented, build/hardware validation pending | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
+| 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
+| 5. Real-image display | Complete at QVGA 30 FPS | Hardware-validated `esp_lcd` ST7789, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
 
-The current sample initializes the sensor, capture controller, two DMA buffers,
-snapshot buffer, and ST7789. It then runs Walking-1 and Color-Bar preflights in
-sequence. Each preflight starts Camera RX before sensor streaming, skips five
-frames, analyzes and snapshots one complete frame, and displays the static crop
-for three seconds while capture diagnostics continue. It then stops the sensor
-and Camera RX. The application finally disables the
-sensor test pattern and remains in standby; real-image streaming is Stage 5.
+The current sample initializes the sensor, capture controller, two Camera DMA
+buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
+Color-Bar preflights in sequence. Each preflight starts Camera RX before sensor
+streaming, skips five frames, analyzes and snapshots one complete frame, and
+displays the static crop for three seconds while capture diagnostics continue.
+It then stops the sensor and Camera RX. The application finally disables the
+sensor test pattern, switches the shared display workspace to RGB565 use, and
+starts continuous real-image streaming. Display work uses a centered 240 x 240
+crop and is dropped rather than blocking Camera Buffer recycling when SPI DMA is
+still busy.
+
+The Stage 5 30 FPS baseline has been built, flashed, and exercised on hardware.
+After both preflights passed, real-image capture remained at approximately
+30.006 FPS and display throughput reached approximately 29.990 FPS for more
+than 1,200 frames. The observed run reported zero Camera size errors, Buffer
+starvation, ready-queue overflows, Buffer-return errors, busy display drops, and
+LCD submission errors. Higher sensor frame rates and higher LCD SPI clocks are
+separate follow-up experiments and do not change this validated baseline.
 
 ## Initial sensor configuration
 
@@ -80,12 +93,14 @@ first size-valid frame after warm-up, the frame task copies the centered crop
 It returns the Camera DMA buffer before notifying `app_main`, so the one-time
 SPI display transfer cannot hold Buffer A or B.
 
-The ST7789 uses SPI2 at 40 MHz. `st7789_display_draw_gray8()` converts the packed
-RAW8 snapshot to RGB565 in small chunks and writes the screen once. Camera RX
+The ST7789 uses SPI2 at 40 MHz through ESP-IDF `esp_lcd` and its asynchronous SPI
+DMA completion callback. `st7789_display_draw_gray8()` converts the packed
+RAW8 preflight snapshot to RGB565 lines and writes the screen once. Camera RX
 and optional diagnostics continue during the static hold, without owning either
 Camera Buffer; they are stopped before switching patterns. The detailed Stage 4 scope is
 recorded in [stage4_todo.md](stage4_todo.md), and the architecture decisions are
-recorded in [stage4_5_todo.md](stage4_5_todo.md).
+recorded in [stage4_5_todo.md](stage4_5_todo.md). The live display lifecycle and
+hardware checklist are recorded in [stage5_todo.md](stage5_todo.md).
 
 The capture component exposes mutually exclusive `NONE`, `WALKING_1`, and
 `COLOR_BAR` analysis modes. Color-Bar observation compares four representative
@@ -154,13 +169,13 @@ components/hm01b0_capture/
   hm01b0_cache_compat.c    ESP-IDF 6.0 internal-SRAM DVP cache workaround
 
 components/st7789_display/
-  include/                 Handle-based SPI display API
-  st7789_display.c         ST7789 initialization and RAW8-to-RGB565 transfer
+  include/                 Handle-based esp_lcd display API and statistics
+  st7789_display.c         ST7789 panel, RGB workspace, conversion and SPI DMA
 
 main/
   board_config.h           Sample board pin mapping
-  app_config.h             Stage 4.5 experiment and preflight policy
-  main.c                   Initialize, run two preflights, disable test output
+  app_config.h             Stage 5 preflight and live-display policy
+  main.c                   Run preflights, then start real-image streaming
 
 examples/
   i2c_finder.c             Standalone I2C diagnostic source
@@ -227,12 +242,13 @@ MODEL_ID_H=0x01, MODEL_ID_L=0xB0, MODEL_ID=0x01B0
 PASS: HM01B0 initialized in STANDBY
 ```
 
-Stage 4.5 reports the 324 x 244 geometry, aligned Buffer A/B allocations,
+Stage 5 reports the 324 x 244 geometry, aligned Buffer A/B allocations,
 transport health, tagged Pattern observations, snapshot copy/hold timing, and
-one-time LCD transfer duration for each preflight. It never prints a complete
-frame. Hardware acceptance requires both static patterns to display, zero size
-or queue/Buffer errors, test pattern OFF at the end, sensor standby, and Camera
-RX stopped.
+one-time LCD transfer duration for each preflight. During real-image streaming
+it reports Camera and display FPS, RGB conversion/submission/DMA timing, and
+busy-Buffer display drops. It never prints a complete frame. Hardware acceptance
+requires both static patterns and the continuous live image to display with zero
+size or Camera queue/Buffer errors.
 
 Board-specific `sdkconfig` files and local editor/tool paths are intentionally
 not committed.
