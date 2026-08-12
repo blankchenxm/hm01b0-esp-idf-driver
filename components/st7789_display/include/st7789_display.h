@@ -65,6 +65,10 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
                                     uint16_t height,
                                     const uint8_t *data);
 
+/** Fill the complete panel with one grayscale value during preflight. */
+esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
+                                     uint8_t gray);
+
 /**
  * End preflight use of the shared workspace and enable full-frame streaming.
  */
@@ -84,8 +88,12 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     uint16_t source_width,
     uint16_t source_height,
     size_t source_stride,
-    uint16_t crop_x,
-    uint16_t crop_y);
+    uint16_t source_x,
+    uint16_t source_y,
+    uint16_t width,
+    uint16_t height,
+    uint16_t destination_x,
+    uint16_t destination_y);
 
 /** Wait until the outstanding SPI color transaction has completed. */
 esp_err_t st7789_display_wait_idle(st7789_display_handle_t *display,

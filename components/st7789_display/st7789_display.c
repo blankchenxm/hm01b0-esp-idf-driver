@@ -427,6 +427,34 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
     return st7789_display_wait_idle(display, 1000U);
 }
 
+esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
+                                     uint8_t gray)
+{
+    ESP_RETURN_ON_FALSE(display != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "display handle is NULL");
+    ESP_RETURN_ON_FALSE(display->preflight_line != NULL,
+                        ESP_ERR_INVALID_STATE, TAG,
+                        "preflight line buffer has been released");
+
+    uint16_t *pixels = (uint16_t *)display->preflight_line;
+    const uint16_t color = display->rgb565_table[gray];
+    for (uint16_t x = 0U; x < display->config.width; ++x) {
+        pixels[x] = color;
+    }
+
+    for (uint16_t row = 0U; row < display->config.height; ++row) {
+        ESP_RETURN_ON_ERROR(st7789_take_buffer(display, portMAX_DELAY), TAG,
+                            "failed to acquire clear line buffer");
+        const esp_err_t ret = st7789_submit(
+            display, 0U, row, display->config.width, 1U,
+            display->preflight_line, row == display->config.height - 1U);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+    return st7789_display_wait_idle(display, 1000U);
+}
+
 esp_err_t st7789_display_get_preflight_buffer(
     st7789_display_handle_t *display,
     uint8_t **buffer,
@@ -473,8 +501,12 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     uint16_t source_width,
     uint16_t source_height,
     size_t source_stride,
-    uint16_t crop_x,
-    uint16_t crop_y)
+    uint16_t source_x,
+    uint16_t source_y,
+    uint16_t width,
+    uint16_t height,
+    uint16_t destination_x,
+    uint16_t destination_y)
 {
     ESP_RETURN_ON_FALSE(display != NULL && source != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
@@ -482,12 +514,17 @@ esp_err_t st7789_display_try_draw_gray8_frame(
                             display->rgb_frame != NULL,
                         ESP_ERR_INVALID_STATE, TAG,
                         "stream buffer is not prepared");
-    ESP_RETURN_ON_FALSE(source_width > 0U && source_height > 0U &&
-                        source_stride >= source_width &&
-                        crop_x < source_width && crop_y < source_height &&
-                        display->config.width <= source_width - crop_x &&
-                        display->config.height <= source_height - crop_y,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid source crop");
+    ESP_RETURN_ON_FALSE(
+        source_width > 0U && source_height > 0U &&
+            source_stride >= source_width && width > 0U && height > 0U &&
+            source_x < source_width && source_y < source_height &&
+            width <= source_width - source_x &&
+            height <= source_height - source_y &&
+            destination_x < display->config.width &&
+            destination_y < display->config.height &&
+            width <= display->config.width - destination_x &&
+            height <= display->config.height - destination_y,
+        ESP_ERR_INVALID_ARG, TAG, "invalid source/destination rectangle");
 
     if (st7789_take_buffer(display, 0U) != ESP_OK) {
         portENTER_CRITICAL(&display->stats_lock);
@@ -497,16 +534,16 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     }
 
     const int64_t convert_start_us = esp_timer_get_time();
-    for (uint16_t row = 0; row < display->config.height; ++row) {
+    for (uint16_t row = 0; row < height; ++row) {
         const uint8_t *source_row =
-            source + (size_t)(crop_y + row) * source_stride + crop_x;
+            source + (size_t)(source_y + row) * source_stride + source_x;
         uint8_t *destination_row =
             display->rgb_frame +
-            (size_t)row * display->config.width *
+            (size_t)row * width *
                 ST7789_RGB565_BYTES_PER_PIXEL;
         st7789_gray8_to_rgb565_be(
             display->rgb565_table,
-            source_row, destination_row, display->config.width);
+            source_row, destination_row, width);
     }
     const uint32_t convert_time_us = (uint32_t)(
         esp_timer_get_time() - convert_start_us);
@@ -519,7 +556,7 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     portEXIT_CRITICAL(&display->stats_lock);
 
     const esp_err_t ret = st7789_submit(
-        display, 0U, 0U, display->config.width, display->config.height,
+        display, destination_x, destination_y, width, height,
         display->rgb_frame, true);
     if (ret == ESP_OK) {
         portENTER_CRITICAL(&display->stats_lock);
