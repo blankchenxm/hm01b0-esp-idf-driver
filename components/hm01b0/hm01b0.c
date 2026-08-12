@@ -57,9 +57,14 @@ static esp_err_t hm01b0_start_mclk(hm01b0_handle_t *dev,
     ESP_RETURN_ON_ERROR(ledc_channel_config(&channel_config), TAG,
                         "failed to route MCLK to GPIO%d", gpio);
 
-    dev->mclk_started = true;
     const uint32_t actual_hz = ledc_get_freq(dev->mclk_speed_mode,
                                              dev->mclk_timer);
+    if (actual_hz == 0U) {
+        (void)ledc_stop(dev->mclk_speed_mode, dev->mclk_channel, 0);
+        return ESP_FAIL;
+    }
+    dev->mclk_started = true;
+    dev->mclk_freq_hz = actual_hz;
     ESP_LOGI(TAG, "MCLK started: GPIO%d, requested=%" PRIu32
                   " Hz, actual=%" PRIu32 " Hz",
              gpio, frequency_hz, actual_hz);
@@ -101,7 +106,6 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
     dev->mclk_speed_mode = LEDC_LOW_SPEED_MODE;
     dev->mclk_timer = LEDC_TIMER_0;
     dev->mclk_channel = LEDC_CHANNEL_0;
-    dev->mclk_freq_hz = config->mclk_freq_hz;
     dev->state = HM01B0_STATE_UNINITIALIZED;
     dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
 

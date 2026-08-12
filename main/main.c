@@ -167,6 +167,8 @@ static esp_err_t hm01b0_run_preflight(
     hm01b0_frame_rect_t analysis_area)
 {
     ESP_LOGI(TAG, "preflight begin: %s", name);
+    uint8_t frame_count_before = 0U;
+    bool frame_count_before_valid = false;
     esp_err_t ret = hm01b0_set_test_pattern(s_sensor, sensor_pattern);
     if (ret != ESP_OK) {
         return ret;
@@ -206,6 +208,16 @@ static esp_err_t hm01b0_run_preflight(
         return ret;
     }
 
+    ret = hm01b0_get_frame_count(s_sensor, &frame_count_before);
+    if (ret == ESP_OK) {
+        frame_count_before_valid = true;
+        ESP_LOGI(TAG, "%s sensor FRAME_COUNT before stream=%u",
+                 name, (unsigned)frame_count_before);
+    } else {
+        ESP_LOGW(TAG, "%s failed to read FRAME_COUNT before stream: %s",
+                 name, esp_err_to_name(ret));
+    }
+
     ret = hm01b0_stream_start(s_sensor);
     if (ret != ESP_OK) {
         (void)hm01b0_capture_rx_stop(s_capture);
@@ -216,6 +228,28 @@ static esp_err_t hm01b0_run_preflight(
         pdTRUE, pdMS_TO_TICKS(APP_PREFLIGHT_CAPTURE_TIMEOUT_MS));
     if (notification == 0U) {
         ESP_LOGE(TAG, "%s preflight timed out waiting for snapshot", name);
+        uint8_t frame_count_after = 0U;
+        const esp_err_t frame_count_result =
+            hm01b0_get_frame_count(s_sensor, &frame_count_after);
+        if (frame_count_result == ESP_OK) {
+            const uint8_t frame_delta =
+                (uint8_t)(frame_count_after - frame_count_before);
+            const char *diagnosis = !frame_count_before_valid
+                ? "baseline unavailable; frame progress is inconclusive"
+                : frame_delta > 0U
+                    ? "sensor generated frames; inspect DVP sync/size"
+                    : "no sensor frame progress observed";
+            ESP_LOGE(TAG,
+                     "%s timeout diagnostic: sensor FRAME_COUNT "
+                     "before=%u after=%u delta(mod256)=%u; %s",
+                     name, (unsigned)frame_count_before,
+                     (unsigned)frame_count_after, (unsigned)frame_delta,
+                     diagnosis);
+        } else {
+            ESP_LOGW(TAG, "%s timeout diagnostic could not read "
+                          "FRAME_COUNT: %s",
+                     name, esp_err_to_name(frame_count_result));
+        }
         (void)hm01b0_stream_stop(s_sensor);
         (void)hm01b0_capture_rx_stop(s_capture);
         return ESP_ERR_TIMEOUT;

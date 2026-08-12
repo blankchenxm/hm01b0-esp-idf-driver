@@ -71,6 +71,10 @@ esp_err_t hm01b0_get_mode_info(hm01b0_mode_t mode,
 /** Return the driver's current state without accessing the sensor bus. */
 hm01b0_state_t hm01b0_get_state(const hm01b0_handle_t *dev);
 
+/** Read the sensor's modulo-256 frame counter (register 0x0005). */
+esp_err_t hm01b0_get_frame_count(hm01b0_handle_t *dev,
+                                 uint8_t *frame_count);
+
 esp_err_t hm01b0_reg_read(hm01b0_handle_t *dev,
                           uint16_t addr,
                           uint8_t *value);

@@ -107,6 +107,14 @@ esp_err_t hm01b0_probe(hm01b0_handle_t *dev, uint16_t *model_id)
     return ESP_OK;
 }
 
+esp_err_t hm01b0_get_frame_count(hm01b0_handle_t *dev,
+                                 uint8_t *frame_count)
+{
+    ESP_RETURN_ON_FALSE(dev != NULL && frame_count != NULL,
+                        ESP_ERR_INVALID_ARG, TAG, "invalid argument");
+    return hm01b0_reg_read(dev, HM01B0_REG_FRAME_COUNT, frame_count);
+}
+
 esp_err_t hm01b0_reset(hm01b0_handle_t *dev)
 {
     ESP_RETURN_ON_FALSE(dev != NULL, ESP_ERR_INVALID_ARG, TAG,
@@ -240,6 +248,24 @@ esp_err_t hm01b0_set_interface(hm01b0_handle_t *dev,
     return ESP_OK;
 }
 
+static esp_err_t hm01b0_read_u16(hm01b0_handle_t *dev,
+                                 uint16_t high_addr,
+                                 uint16_t low_addr,
+                                 uint16_t *value)
+{
+    ESP_RETURN_ON_FALSE(value != NULL, ESP_ERR_INVALID_ARG, TAG,
+                        "16-bit register result is NULL");
+
+    uint8_t high = 0U;
+    uint8_t low = 0U;
+    ESP_RETURN_ON_ERROR(hm01b0_reg_read(dev, high_addr, &high), TAG,
+                        "failed to read register 0x%04X", high_addr);
+    ESP_RETURN_ON_ERROR(hm01b0_reg_read(dev, low_addr, &low), TAG,
+                        "failed to read register 0x%04X", low_addr);
+    *value = ((uint16_t)high << 8U) | low;
+    return ESP_OK;
+}
+
 esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
                                 hm01b0_frame_rate_t frame_rate)
 {
@@ -344,6 +370,36 @@ esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
                            sizeof(timing_table) / sizeof(timing_table[0])),
         TAG, "failed to apply frame timing");
 
+    uint16_t readback_line_length = 0U;
+    uint16_t readback_frame_length = 0U;
+    uint16_t readback_max_integration = 0U;
+    ESP_RETURN_ON_ERROR(
+        hm01b0_read_u16(dev, HM01B0_REG_LINE_LENGTH_PCK_H,
+                        HM01B0_REG_LINE_LENGTH_PCK_L,
+                        &readback_line_length),
+        TAG, "failed to read back line length");
+    ESP_RETURN_ON_ERROR(
+        hm01b0_read_u16(dev, HM01B0_REG_FRAME_LENGTH_LINES_H,
+                        HM01B0_REG_FRAME_LENGTH_LINES_L,
+                        &readback_frame_length),
+        TAG, "failed to read back frame length");
+    ESP_RETURN_ON_ERROR(
+        hm01b0_read_u16(dev, HM01B0_REG_MAX_INTEGRATION_H,
+                        HM01B0_REG_MAX_INTEGRATION_L,
+                        &readback_max_integration),
+        TAG, "failed to read back maximum integration");
+    ESP_RETURN_ON_FALSE(
+        readback_line_length == line_length_pck &&
+            readback_frame_length == frame_length_lines &&
+            readback_max_integration == max_integration,
+        ESP_ERR_INVALID_RESPONSE, TAG,
+        "frame timing readback mismatch: expected line=%u frame=%u "
+        "max_integration=%u, read line=%u frame=%u max_integration=%u",
+        (unsigned)line_length_pck, (unsigned)frame_length_lines,
+        (unsigned)max_integration, (unsigned)readback_line_length,
+        (unsigned)readback_frame_length,
+        (unsigned)readback_max_integration);
+
     dev->frame_rate = frame_rate;
     const uint32_t actual_fps_milli = (uint32_t)(
         ((uint64_t)sensor_core_hz * 1000U) /
@@ -357,6 +413,12 @@ esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
              (unsigned)line_length_pck,
              (unsigned)frame_length_lines,
              (unsigned)max_integration);
+    ESP_LOGI(TAG,
+             "frame timing readback verified: line_length=%u, "
+             "frame_length=%u, max_integration=%u",
+             (unsigned)readback_line_length,
+             (unsigned)readback_frame_length,
+             (unsigned)readback_max_integration);
     return ESP_OK;
 }
 
