@@ -33,6 +33,16 @@ typedef enum {
 } hm01b0_interface_t;
 
 typedef enum {
+    HM01B0_FRAME_RATE_UNCONFIGURED = 0,
+    HM01B0_FRAME_RATE_15 = 15,
+    HM01B0_FRAME_RATE_20 = 20,
+    HM01B0_FRAME_RATE_30 = 30,
+    HM01B0_FRAME_RATE_45 = 45,
+    HM01B0_FRAME_RATE_60 = 60,
+    HM01B0_FRAME_RATE_120 = 120,
+} hm01b0_frame_rate_t;
+
+typedef enum {
     HM01B0_TEST_PATTERN_OFF = 0,
     HM01B0_TEST_PATTERN_COLOR_BAR,
     HM01B0_TEST_PATTERN_WALKING_1,
@@ -72,6 +82,7 @@ typedef struct {
 
     hm01b0_mode_t initial_mode;
     hm01b0_interface_t data_interface;
+    hm01b0_frame_rate_t frame_rate;
     hm01b0_test_pattern_t test_pattern;
 } hm01b0_config_t;
 

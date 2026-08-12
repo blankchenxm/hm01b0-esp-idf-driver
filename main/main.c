@@ -176,6 +176,7 @@ static esp_err_t hm01b0_run_preflight(
         .pattern = diagnostic_pattern,
         .area = analysis_area,
         .warmup_frames = APP_PREFLIGHT_WARMUP_FRAMES,
+        .sample_interval_frames = APP_PREFLIGHT_DIAGNOSTIC_INTERVAL,
     };
     ret = hm01b0_capture_set_diagnostics(s_capture, &diagnostic_config);
     if (ret != ESP_OK) {
@@ -356,6 +357,7 @@ void app_main(void)
         .enable_internal_i2c_pullups = true,
         .initial_mode = APP_HM01B0_MODE,
         .data_interface = APP_HM01B0_INTERFACE,
+        .frame_rate = APP_HM01B0_FRAME_RATE,
         .test_pattern = HM01B0_TEST_PATTERN_OFF,
     };
     ret = hm01b0_new(&sensor_config, &s_sensor);

@@ -22,6 +22,7 @@
 #define ST7789_GMCTRN1  0xE1U
 
 #define ST7789_RGB565_BYTES_PER_PIXEL 2U
+#define ST7789_GRAY8_LUT_SIZE         256U
 #define ST7789_SPI_QUEUE_DEPTH        1U
 
 struct st7789_display {
@@ -35,6 +36,7 @@ struct st7789_display {
     size_t preflight_line_size;
     uint8_t *rgb_frame;
     size_t rgb_frame_size;
+    uint16_t rgb565_table[ST7789_GRAY8_LUT_SIZE];
     bool bus_initialized;
     bool stream_prepared;
     bool transfer_completes_frame;
@@ -139,18 +141,32 @@ static esp_err_t st7789_send_tuning(st7789_display_handle_t *display)
     return ESP_OK;
 }
 
-static void st7789_gray8_to_rgb565_be(const uint8_t *source,
+static void st7789_init_rgb565_table(st7789_display_handle_t *display)
+{
+    for (uint16_t gray = 0U; gray < ST7789_GRAY8_LUT_SIZE; ++gray) {
+        const uint16_t rgb565 =
+            (uint16_t)(((gray >> 3U) << 11U) |
+                       ((gray >> 2U) << 5U) |
+                       (gray >> 3U));
+
+        /*
+         * ESP32-S3 stores uint16_t little-endian, while the validated panel
+         * byte stream is RGB565 MSB first. Store the byte-swapped word once
+         * so the hot conversion loop needs only a lookup and a 16-bit store.
+         */
+        display->rgb565_table[gray] =
+            (uint16_t)((rgb565 >> 8U) | (rgb565 << 8U));
+    }
+}
+
+static void st7789_gray8_to_rgb565_be(const uint16_t *rgb565_table,
+                                      const uint8_t *source,
                                       uint8_t *destination,
                                       size_t pixel_count)
 {
+    uint16_t *destination_pixels = (uint16_t *)destination;
     for (size_t i = 0; i < pixel_count; ++i) {
-        const uint8_t gray = source[i];
-        const uint16_t rgb565 =
-            (uint16_t)(((uint16_t)(gray >> 3U) << 11U) |
-                       ((uint16_t)(gray >> 2U) << 5U) |
-                       (gray >> 3U));
-        destination[i * 2U] = (uint8_t)(rgb565 >> 8U);
-        destination[i * 2U + 1U] = (uint8_t)rgb565;
+        destination_pixels[i] = rgb565_table[source[i]];
     }
 }
 
@@ -226,6 +242,7 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
                         "failed to allocate display context");
     display->config = *config;
     display->stats_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
+    st7789_init_rgb565_table(display);
     display->rgb_frame_size = (size_t)config->width * config->height *
                               ST7789_RGB565_BYTES_PER_PIXEL;
     display->preflight_line_size =
@@ -326,9 +343,10 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
     st7789_display_reset_stats(display);
     ESP_LOGI(TAG,
              "ST7789 initialized with esp_lcd (%ux%u RGB565, SPI=%" PRIu32
-             " Hz, max_transfer=%u)",
+             " Hz, max_transfer=%u, gray_lut=%u bytes)",
              config->width, config->height, config->clock_speed_hz,
-             (unsigned)display->rgb_frame_size);
+             (unsigned)display->rgb_frame_size,
+             (unsigned)sizeof(display->rgb565_table));
     *out_display = display;
     return ESP_OK;
 
@@ -396,6 +414,7 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
         ESP_RETURN_ON_ERROR(st7789_take_buffer(display, portMAX_DELAY), TAG,
                             "failed to acquire preflight line buffer");
         st7789_gray8_to_rgb565_be(
+            display->rgb565_table,
             data + (size_t)row * width,
             display->preflight_line, width);
         const esp_err_t ret = st7789_submit(
@@ -486,6 +505,7 @@ esp_err_t st7789_display_try_draw_gray8_frame(
             (size_t)row * display->config.width *
                 ST7789_RGB565_BYTES_PER_PIXEL;
         st7789_gray8_to_rgb565_be(
+            display->rgb565_table,
             source_row, destination_row, display->config.width);
     }
     const uint32_t convert_time_us = (uint32_t)(

@@ -14,9 +14,11 @@ struct hm01b0_dev {
     ledc_timer_t mclk_timer;
     ledc_channel_t mclk_channel;
     bool mclk_started;
+    uint32_t mclk_freq_hz;
     hm01b0_state_t state;
     hm01b0_mode_t mode;
     hm01b0_interface_t interface;
+    hm01b0_frame_rate_t frame_rate;
     hm01b0_test_pattern_t test_pattern;
 };
 

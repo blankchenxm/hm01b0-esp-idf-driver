@@ -26,7 +26,7 @@ initialize sensor and esp_lcd ST7789
 - [x] Replace the custom ST7789 SPI transport with ESP-IDF `esp_lcd`.
 - [x] Preserve the validated porch, gate, VCOM, power, frame-rate, gamma, and
   inversion settings on top of the standard ST7789 panel initialization.
-- [x] Configure SPI2 at 40 MHz with a 115,200-byte maximum color transfer.
+- [x] Configure SPI2 at 80 MHz with a 115,200-byte maximum color transfer.
 - [x] Reserve one 240x240 RGB565 internal DMA-capable Buffer before Camera
   Buffer A/B are allocated, avoiding late-allocation fragmentation.
 - [x] Reuse the first half of that workspace as the 240x240 RAW8 preflight
@@ -52,7 +52,7 @@ initialize sensor and esp_lcd ST7789
 
 - Two complete 79,056-byte Camera Buffers in internal DMA-capable SRAM.
 - No Camera backup Buffer, no third Camera Buffer, and no PSRAM.
-- HM01B0 QVGA 324x244 RAW8 transport at approximately 30 FPS.
+- HM01B0 QVGA 324x244 RAW8 transport at approximately 60 FPS.
 - Center crop `(42,2,240,240)` rather than scaling the full 320-pixel field of
   view to the 240-pixel display.
 - One complete RGB565 display Buffer. A busy Buffer drops display work without
@@ -94,9 +94,72 @@ The reported `dma` interval starts immediately before
 callback. It therefore includes the measured draw-call interval and must not be
 added to `submit` when calculating end-to-end latency.
 
+## FPS optimization 1: 80 MHz SPI and RGB565 lookup
+
+Tracked separately by GitHub Issue #9 so the hardware-validated 40 MHz commit
+remains an exact rollback point.
+
+- [x] Request an 80 MHz ST7789 SPI clock instead of 40 MHz.
+- [x] Precompute all 256 RAW8 grayscale-to-RGB565 mappings during display
+  initialization.
+- [x] Store lookup words in the byte order that reproduces the validated
+  MSB-first ST7789 stream on the little-endian ESP32-S3.
+- [x] Replace repeated per-pixel shifts and masks with one lookup and one
+  16-bit destination write.
+- [x] Use the same lookup conversion for preflight lines and live frames.
+- [x] Build and flash in the owner's ESP-IDF 6.0 environment.
+- [x] Confirm Walking-1, Color-Bar, and real images remain visually correct at
+  80 MHz.
+- [x] Compare conversion, draw-call, completion, processing, and Buffer-hold
+  maxima against the validated 40 MHz baseline.
+- [x] Confirm all Camera and display error counters remain zero.
+
+The 80 MHz/LUT step first measured display-path headroom at the validated
+30 FPS sensor timing. The next step uses that headroom for a QVGA 60 FPS
+sensor-timing experiment.
+
+## FPS optimization 2: QVGA 60 FPS sensor timing
+
+- [x] Add public 15/20/30/45/60/120 FPS preset types.
+- [x] Add `hm01b0_set_frame_rate()` and require standby configuration.
+- [x] Derive Sensor_Core from MCLK and the selected interface divider.
+- [x] Enforce the datasheet minimum line/frame lengths and per-mode maximum
+  frame rate.
+- [x] Calculate `FRAME_LENGTH_LINES` without exceeding the requested FPS.
+- [x] Keep `MAX_INTEGRATION = FRAME_LENGTH_LINES - 2`.
+- [x] Select `HM01B0_FRAME_RATE_60` from `main/app_config.h`.
+- [x] For the current 12 MHz target, /2, QVGA configuration, produce
+  `LINE_LENGTH_PCK=376`, `FRAME_LENGTH_LINES=266`, and
+  `MAX_INTEGRATION=264` (calculated 59.990 FPS).
+- [x] Build and flash in the owner's ESP-IDF 6.0 environment.
+- [x] Confirm both preflights run at approximately 60 FPS.
+- [x] Confirm real-image Camera and display throughput approach 60 FPS.
+- [x] Record `dropped_busy`, `no_buffer`, `ready_overflow`, and timing maxima.
+- [x] Confirm the live image remains stable at 80 MHz SPI.
+
+## Validated 60 FPS result
+
+Owner hardware validation on 2026-08-12 established the completed Stage 5
+configuration:
+
+- Requested external MCLK: 12 MHz; the actual LEDC rate is measured and used
+  for timing calculations.
+- Sensor_Core target: 6 MHz; the driver accepts at most 6.03 MHz to cover the
+  measured LEDC quantization error of this board.
+- Real-image Camera transport: approximately 59.943 FPS.
+- ST7789 display throughput: approximately 59.937 FPS.
+- Sustained observation: more than 6,600 valid Camera frames.
+- Timing maxima: approximately 3,667 us conversion, 10,295 us draw-call
+  return, 11,978 us request-to-DMA-completion, 14,381 us processing, and
+  14,385 us Camera Buffer hold.
+- Error counters remained zero: `size_err`, `no_buffer`, `ready_overflow`,
+  `free_err`, `dropped_busy`, and `submit_err`.
+- Preflight Pattern analysis is sampled every 60 frames, and its saved 64-byte
+  first-frame sample is printed only after Camera RX stops, so neither operation
+  holds a Camera Buffer across the next 60 FPS frame boundary.
+
 ## Deferred
 
-- [ ] 60 FPS sensor timing and higher SPI clock experiments.
 - [ ] TE/vertical-blank synchronization and tearing control.
 - [ ] Full 320-to-240 horizontal downscaling.
 - [ ] A second complete RGB565 Buffer.

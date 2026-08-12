@@ -48,6 +48,18 @@ esp_err_t hm01b0_set_mode(hm01b0_handle_t *dev, hm01b0_mode_t mode);
 esp_err_t hm01b0_set_interface(hm01b0_handle_t *dev,
                                hm01b0_interface_t interface);
 
+/**
+ * @brief Configure frame timing for the current mode and interface.
+ *
+ * The driver keeps LINE_LENGTH_PCK at the datasheet minimum for the current
+ * mode, derives FRAME_LENGTH_LINES from Sensor_Core and the requested preset,
+ * and keeps MAX_INTEGRATION at FRAME_LENGTH_LINES - 2. Configuration is only
+ * allowed in standby. A preset that cannot be reached by the current clock,
+ * interface divider, and mode constraints returns ESP_ERR_NOT_SUPPORTED.
+ */
+esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
+                                hm01b0_frame_rate_t frame_rate);
+
 /** Select test-pattern off, color bar, or walking-1 while in standby. */
 esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
                                   hm01b0_test_pattern_t pattern);
