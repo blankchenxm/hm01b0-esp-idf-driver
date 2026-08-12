@@ -9,7 +9,12 @@
 #include "hm01b0_tables.h"
 
 #define HM01B0_RESET_RECOVERY_US 1000U
-#define HM01B0_SENSOR_CORE_MAX_HZ 6000000U
+#define HM01B0_SENSOR_CORE_DATASHEET_MAX_HZ 6000000U
+/* Allow the measured LEDC clock to exceed its 6 MHz target by at most 0.5%. */
+#define HM01B0_SENSOR_CORE_CLOCK_TOLERANCE_HZ 30000U
+#define HM01B0_SENSOR_CORE_LIMIT_HZ \
+    (HM01B0_SENSOR_CORE_DATASHEET_MAX_HZ + \
+     HM01B0_SENSOR_CORE_CLOCK_TOLERANCE_HZ)
 
 static const char *TAG = "hm01b0_sensor";
 
@@ -105,14 +110,6 @@ esp_err_t hm01b0_probe(hm01b0_handle_t *dev, uint16_t *model_id)
     }
 
     return ESP_OK;
-}
-
-esp_err_t hm01b0_get_frame_count(hm01b0_handle_t *dev,
-                                 uint8_t *frame_count)
-{
-    ESP_RETURN_ON_FALSE(dev != NULL && frame_count != NULL,
-                        ESP_ERR_INVALID_ARG, TAG, "invalid argument");
-    return hm01b0_reg_read(dev, HM01B0_REG_FRAME_COUNT, frame_count);
 }
 
 esp_err_t hm01b0_reset(hm01b0_handle_t *dev)
@@ -307,10 +304,10 @@ esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
     const uint32_t sensor_core_hz = dev->mclk_freq_hz / core_divider;
     ESP_RETURN_ON_FALSE(
         sensor_core_hz > 0U &&
-            sensor_core_hz <= HM01B0_SENSOR_CORE_MAX_HZ,
+            sensor_core_hz <= HM01B0_SENSOR_CORE_LIMIT_HZ,
         ESP_ERR_NOT_SUPPORTED, TAG,
         "Sensor_Core=%" PRIu32 " Hz is outside supported range 1..%u Hz",
-        sensor_core_hz, (unsigned)HM01B0_SENSOR_CORE_MAX_HZ);
+        sensor_core_hz, (unsigned)HM01B0_SENSOR_CORE_LIMIT_HZ);
 
     const uint16_t line_length_pck = constraints.min_line_length_pck;
     const uint64_t frame_denominator =

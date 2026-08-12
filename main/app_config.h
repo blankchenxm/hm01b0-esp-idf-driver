@@ -4,8 +4,8 @@
 #include "hm01b0.h"
 
 /* Sensor policy for the Stage 5 sample application. */
-/* Leave LEDC quantization margin so actual MCLK stays at or below 12 MHz. */
-#define APP_HM01B0_MCLK_FREQUENCY_HZ 11990000U
+/* The driver permits 0.5% Sensor_Core tolerance for LEDC quantization. */
+#define APP_HM01B0_MCLK_FREQUENCY_HZ 12000000U
 #define APP_HM01B0_I2C_FREQUENCY_HZ    100000U
 #define APP_HM01B0_MODE HM01B0_SENSOR_MODE_QVGA
 #define APP_HM01B0_INTERFACE HM01B0_DATA_INTERFACE_8_BIT
@@ -27,7 +27,7 @@
 #define APP_DISPLAY_CROP_WIDTH  240U
 #define APP_DISPLAY_CROP_HEIGHT 240U
 
-/* Stage 5 FPS experiment: validate the ST7789 and wiring at 80 MHz. */
+/* Hardware-validated ST7789 configuration for QVGA 60 FPS display. */
 #define APP_ST7789_WIDTH          240U
 #define APP_ST7789_HEIGHT         240U
 #define APP_ST7789_CLOCK_HZ  80000000U

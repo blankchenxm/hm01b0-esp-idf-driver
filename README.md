@@ -21,7 +21,7 @@ ST7789 driver and one complete internal-DMA RGB565 display Buffer.
 | 3. DVP capture | Complete | ESP32-S3 LCD_CAM/GDMA, two internal DMA frame buffers, callbacks, dual CRC and selectable test-pattern observation |
 | 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 | 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
-| 5. Real-image display | Complete at QVGA 30 FPS | Hardware-validated `esp_lcd` ST7789, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
+| 5. Real-image display | Complete at QVGA 60 FPS | Hardware-validated 80 MHz `esp_lcd` ST7789, RGB565 lookup conversion, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
 
 The current sample initializes the sensor, capture controller, two Camera DMA
 buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
@@ -34,13 +34,12 @@ starts continuous real-image streaming. Display work uses a centered 240 x 240
 crop and is dropped rather than blocking Camera Buffer recycling when SPI DMA is
 still busy.
 
-The Stage 5 30 FPS baseline has been built, flashed, and exercised on hardware.
+Stage 5 has been built, flashed, and exercised on hardware at QVGA 60 FPS.
 After both preflights passed, real-image capture remained at approximately
-30.006 FPS and display throughput reached approximately 29.990 FPS for more
-than 1,200 frames. The observed run reported zero Camera size errors, Buffer
+59.943 FPS and display throughput reached approximately 59.937 FPS for more
+than 6,600 frames. The observed run reported zero Camera size errors, Buffer
 starvation, ready-queue overflows, Buffer-return errors, busy display drops, and
-LCD submission errors. Higher sensor frame rates and higher LCD SPI clocks are
-separate follow-up experiments and do not change this validated baseline.
+LCD submission errors.
 
 ## Initial sensor configuration
 
@@ -52,10 +51,10 @@ separate follow-up experiments and do not change this validated baseline.
 | Initial/final test pattern | Off; Walking-1 and Color-Bar are enabled only during startup preflight |
 | Operation | Non-SYNC |
 | PCLK | Non-gated, rising edge |
-| MCLK | 12 MHz external clock |
-| Sensor_Core | MCLK / 2 = 6 MHz |
+| MCLK | 12 MHz requested external clock; actual LEDC rate is measured at runtime |
+| Sensor_Core | MCLK / 2, with a 0.5% software tolerance for LEDC quantization |
 | Sensor_Register | MCLK / 1 = 12 MHz |
-| Frame timing | Current experiment: 376 PCK x 266 lines, approximately 60 FPS; validated baseline: 376 x 532, approximately 30 FPS |
+| Frame timing | 376 PCK x 266 lines, approximately 60 FPS |
 | I2C address | `0x24` (7-bit) |
 | Expected model ID | `0x01B0` |
 
@@ -100,10 +99,9 @@ first size-valid frame after warm-up, the frame task copies the centered crop
 It returns the Camera DMA buffer before notifying `app_main`, so the one-time
 SPI display transfer cannot hold Buffer A or B.
 
-The validated Stage 5 baseline uses SPI2 at 40 MHz through ESP-IDF `esp_lcd`
-and its asynchronous SPI DMA completion callback. The current Issue #9
-performance experiment requests 80 MHz and replaces per-pixel RGB565 bit
-operations with a precomputed 256-entry lookup table.
+The validated Stage 5 configuration uses SPI2 at 80 MHz through ESP-IDF
+`esp_lcd` and its asynchronous SPI DMA completion callback. A precomputed
+256-entry lookup table replaces repeated per-pixel RGB565 bit operations.
 `st7789_display_draw_gray8()` converts the packed
 RAW8 preflight snapshot to RGB565 lines and writes the screen once. Camera RX
 and optional diagnostics continue during the static hold, without owning either
