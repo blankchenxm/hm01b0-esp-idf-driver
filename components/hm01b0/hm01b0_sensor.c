@@ -204,6 +204,10 @@ esp_err_t hm01b0_set_mode(hm01b0_handle_t *dev, hm01b0_mode_t mode)
 
     ESP_RETURN_ON_ERROR(hm01b0_write_table(dev, table, count), TAG,
                         "failed to apply %s mode table", name);
+    ESP_RETURN_ON_ERROR(
+        hm01b0_reg_write(dev, HM01B0_REG_GROUP_PARAMETER_HOLD,
+                         HM01B0_GROUP_PARAMETER_APPLY),
+        TAG, "failed to latch %s mode CMU parameters", name);
     dev->mode = mode;
     dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
     ESP_LOGI(TAG, "mode=%s", name);
@@ -364,6 +368,13 @@ esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
             .mask = UINT8_MAX,
             .delay_ms = 0U,
         },
+        {
+            /* Latch the pending CMU timing values before streaming. */
+            .addr = HM01B0_REG_GROUP_PARAMETER_HOLD,
+            .value = HM01B0_GROUP_PARAMETER_APPLY,
+            .mask = UINT8_MAX,
+            .delay_ms = 0U,
+        },
     };
     ESP_RETURN_ON_ERROR(
         hm01b0_write_table(dev, timing_table,
@@ -415,10 +426,11 @@ esp_err_t hm01b0_set_frame_rate(hm01b0_handle_t *dev,
              (unsigned)max_integration);
     ESP_LOGI(TAG,
              "frame timing readback verified: line_length=%u, "
-             "frame_length=%u, max_integration=%u",
+             "frame_length=%u, max_integration=%u, CMU apply=0x%02X",
              (unsigned)readback_line_length,
              (unsigned)readback_frame_length,
-             (unsigned)readback_max_integration);
+             (unsigned)readback_max_integration,
+             HM01B0_GROUP_PARAMETER_APPLY);
     return ESP_OK;
 }
 

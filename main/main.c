@@ -234,11 +234,18 @@ static esp_err_t hm01b0_run_preflight(
         if (frame_count_result == ESP_OK) {
             const uint8_t frame_delta =
                 (uint8_t)(frame_count_after - frame_count_before);
+            const bool reset_transition_only =
+                frame_count_before == UINT8_MAX &&
+                frame_count_after == 0U && frame_delta == 1U;
             const char *diagnosis = !frame_count_before_valid
                 ? "baseline unavailable; frame progress is inconclusive"
-                : frame_delta > 0U
-                    ? "sensor generated frames; inspect DVP sync/size"
-                    : "no sensor frame progress observed";
+                : reset_transition_only
+                    ? "counter only left its reset value; no sustained "
+                      "frame progress was observed"
+                    : frame_delta <= 1U
+                        ? "no sustained sensor frame progress observed"
+                        : "frame counter advanced; compare the delta with "
+                          "the expected frame count before inspecting DVP";
             ESP_LOGE(TAG,
                      "%s timeout diagnostic: sensor FRAME_COUNT "
                      "before=%u after=%u delta(mod256)=%u; %s",

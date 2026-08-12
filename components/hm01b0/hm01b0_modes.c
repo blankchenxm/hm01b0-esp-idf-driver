@@ -26,9 +26,6 @@
  * initialization sequence and are named centrally in hm01b0_regs.h.
  */
 const hm01b0_regval_t hm01b0_common_init[] = {
-    /* GROUP_PARAMETER_HOLD is write-only: 0 consumes pending parameters. */
-    HM01B0_REG_WRITE(HM01B0_REG_GROUP_PARAMETER_HOLD, 0x00U),
-
     HM01B0_REG_WRITE(HM01B0_REG_BLC_TARGET, 0x08U),
     HM01B0_REG_WRITE(HM01B0_REG_BLC2_TARGET, 0x08U),
 

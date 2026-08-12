@@ -14,6 +14,9 @@
 #define HM01B0_REG_SW_RESET                     0x0103U
 #define HM01B0_REG_GROUP_PARAMETER_HOLD         0x0104U
 
+/* Established HM01B0 drivers write 0x01 after changing CMU registers. */
+#define HM01B0_GROUP_PARAMETER_APPLY             0x01U
+
 #define HM01B0_MODE_SELECT_MASK                 0x07U
 #define HM01B0_MODE_STANDBY                     0x00U
 #define HM01B0_MODE_STREAMING                   0x01U
