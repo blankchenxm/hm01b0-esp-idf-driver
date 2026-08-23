@@ -29,9 +29,6 @@ typedef struct {
 
 typedef struct {
     size_t frame_buffer_size;
-    size_t strip_buffer_size;
-    uint16_t strip_height;
-    uint8_t strip_buffer_count;
     uint32_t submitted_frames;
     uint32_t completed_frames;
     uint32_t dropped_busy;
@@ -52,10 +49,9 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
 esp_err_t st7789_display_delete(st7789_display_handle_t *display);
 
 /**
- * Borrow the shared display workspace as packed RAW8 preflight storage. A mode
- * may use less than the returned capacity. The pointer remains owned by the
- * display component. Streaming later reinterprets the same memory as two
- * RGB565 Strip Buffers.
+ * Borrow the first half of the reserved RGB565 frame workspace as packed RAW8
+ * preflight storage. A mode may use less than the returned capacity. The
+ * pointer remains owned by the display component.
  */
 esp_err_t st7789_display_get_preflight_buffer(
     st7789_display_handle_t *display,
@@ -75,21 +71,18 @@ esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
                                      uint8_t gray);
 
 /**
- * End preflight use of the shared workspace and split it into two RGB565 Strip
- * Buffers for pipelined streaming.
+ * End preflight use of the shared workspace and enable full-frame streaming.
  */
 esp_err_t st7789_display_prepare_stream(st7789_display_handle_t *display);
 
 /**
- * Pipelined live-frame submission.
+ * Non-blocking live-frame submission.
  *
- * The source is valid only for this call. At frame entry, both Strip Buffers
- * are acquired without blocking; ESP_ERR_TIMEOUT means the previous display
- * frame still owns a Strip and this frame was intentionally dropped. Once a
- * frame is accepted, the selected rectangle is converted in 60-row pieces and
- * alternated between the two Strip Buffers while SPI DMA sends the preceding
- * piece. All source pixels have left the Camera Buffer before this function
- * returns, although the final Strip can still be in flight.
+ * The source is valid only for this call. The selected source rectangle is
+ * converted into the beginning of the RGB565 workspace and submitted to the
+ * requested panel destination. Conversion finishes before this function
+ * returns. ESP_ERR_TIMEOUT means the single RGB565 buffer is still owned by
+ * SPI DMA and this display frame was intentionally dropped.
  */
 esp_err_t st7789_display_try_draw_gray8_frame(
     st7789_display_handle_t *display,
@@ -104,7 +97,7 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     uint16_t destination_x,
     uint16_t destination_y);
 
-/** Wait until every outstanding SPI color transaction has completed. */
+/** Wait until the outstanding SPI color transaction has completed. */
 esp_err_t st7789_display_wait_idle(st7789_display_handle_t *display,
                                   uint32_t timeout_ms);
 

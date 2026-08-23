@@ -22,15 +22,16 @@ window. The DVP transport is therefore 162x122 rather than 162x162. The panel
 is cleared to black once before preflight, and only the centered 160x120 region
 is updated afterwards, preserving black borders without a scaling pass.
 
-## Shared workspace and Strip lifecycle
+## Shared Buffer lifecycle
 
-The display component allocates one 57,600-byte internal-DMA workspace:
+The display component still allocates exactly one complete 240x240 RGB565
+internal-DMA workspace:
 
 ```text
-240 x 240 RAW8 = 57,600 bytes
+240 x 240 x 2 = 115,200 bytes
 ```
 
-Before live streaming, that address is borrowed as packed RAW8 Snapshot
+Before live streaming, the same address is borrowed as packed RAW8 Snapshot
 storage:
 
 | Mode | RAW8 Snapshot | Borrowed bytes |
@@ -40,30 +41,10 @@ storage:
 | QQVGA | 160x120 | 19,200 |
 
 There is no separate long-lived Snapshot allocation. After both preflights,
-`st7789_display_prepare_stream()` ends RAW8 use and splits the same address:
-
-```text
-57,600-byte Workspace
-|-- Strip A: 240 x 60 x 2 = 28,800 bytes
-`-- Strip B: 240 x 60 x 2 = 28,800 bytes
-```
-
-Full and QVGA alternate four `240x60` Strips per displayed frame. QQVGA
-alternates two `160x60` Strips; each uses 19,200 bytes of the corresponding
-28,800-byte capacity. The SPI transaction queue depth is two. A completion
-callback returns the matching Strip, and only completion of the final Strip
-increments the completed-frame count. All source rows have been copied out
-before the Camera Buffer is returned, while the last Strip may continue in SPI
-DMA.
-
-Runtime timing fields now have frame-level Strip semantics:
-
-- `convert`: sum of CPU time spent converting every Strip in the frame; time
-  waiting for SPI is excluded.
-- `submit`: sum of all `esp_lcd_panel_draw_bitmap()` call durations, including
-  any wait needed to recycle the preceding SPI transaction.
-- `dma`: wall time from the first Strip submission to the final Strip DMA
-  callback; it includes the conversion/submission overlap between those points.
+`st7789_display_prepare_stream()` ends RAW8 use and makes the whole workspace
+available for RGB565 conversion and SPI DMA. Full and QVGA submit 115,200 bytes
+per displayed frame; QQVGA packs and submits only 38,400 bytes from the
+beginning of the same workspace.
 
 Camera A/B continue to contain complete uncropped DVP frames:
 
@@ -75,10 +56,10 @@ Camera A/B continue to contain complete uncropped DVP frames:
 
 Actual allocation capacity is still reported by
 `esp_cam_ctlr_get_frame_buffer_len()` and may include driver requirements.
-The Strip workspace replaces the Stage 5 complete 115,200-byte RGB565 Buffer.
-For Full, the two RAW8 Camera payloads plus display workspace require 267,552
-bytes before allocator alignment and controller/task overhead, instead of
-325,152 bytes with a complete RGB565 frame.
+Full deliberately keeps the complete RGB565 workspace for the first hardware
+test. If internal DMA Heap or its largest continuous block is insufficient, the
+existing allocation diagnostics must fail cleanly before strip buffering,
+PSRAM, or another architecture is considered.
 
 ## Frame-rate policy
 
@@ -132,22 +113,18 @@ longer user-maintained macros.
 - [x] Derive Snapshot and live source rectangles from the standard valid area.
 - [x] Generalize live RGB565 submission to a rectangular panel destination.
 - [x] Clear the panel to black before QQVGA partial updates.
-- [x] Reuse one shared workspace for all preflight Snapshots and live Strips.
+- [x] Reuse one RGB565 workspace for all preflight Snapshots.
 - [x] Remove fixed QVGA crop macros and QVGA-only runtime logs.
-- [x] Keep the selected mode/rate policy centralized in `app_config.h`.
-- [x] Replace the complete RGB565 frame with two alternating 240x60 Strips.
-- [x] Submit four Strips for Full/QVGA and two Strips for QQVGA.
-- [x] Track per-frame conversion, aggregate submission, and first-to-final
-  Strip DMA timing.
+- [x] Keep QVGA 60 FPS as the default configuration.
 
 ## Owner hardware validation
 
+- [ ] Build and flash the unchanged QVGA 60 FPS default as a regression check.
+- [ ] Confirm QVGA Pattern preflights and live display remain correct.
 - [ ] Select Full 30 FPS and record both Camera Buffer allocations and Heap
   diagnostics.
 - [ ] Confirm Full uses 324x324 transport and a centered 240x240 image.
 - [ ] If Full 30 FPS succeeds, repeat at Full 45 FPS.
-- [ ] Select QVGA 60 FPS as a regression check.
-- [ ] Confirm QVGA Pattern preflights and live display remain correct.
 - [ ] Select QQVGA 60 FPS and confirm 162x122 transport.
 - [ ] Confirm the QQVGA 160x120 image is centered at `(40,60)` with stable black
   borders.
@@ -155,8 +132,6 @@ longer user-maintained macros.
 - [ ] Confirm Walking-1 and Color-Bar preflights in every tested mode.
 - [ ] Confirm `size_err`, `no_buffer`, `ready_overflow`, `free_err`,
   `dropped_busy`, and `submit_err` remain zero.
-- [ ] Confirm the display log reports a 57,600-byte workspace and two
-  28,800-byte, 60-row Strips.
 - [ ] Record Camera/display FPS and conversion/submission/DMA/Buffer-hold
   maxima for each mode/rate pair.
 
@@ -164,5 +139,6 @@ longer user-maintained macros.
 
 - [ ] Runtime mode switching without recreating Camera resources.
 - [ ] QQVGA scaling to 240x180 or 240x240.
-- [ ] A third Camera Buffer or PSRAM.
+- [ ] Full-mode strip Buffer fallback if the complete-buffer allocation fails.
+- [ ] A second RGB565 Buffer, a third Camera Buffer, or PSRAM.
 - [ ] QQVGA presets above 120 FPS.
