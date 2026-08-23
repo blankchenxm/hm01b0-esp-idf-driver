@@ -742,17 +742,40 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
     handle->dma_heap_largest_before =
         heap_caps_get_largest_free_block(dma_caps);
+    ESP_LOGI(TAG,
+             "allocating %u Camera Buffers, each=%u bytes internal DMA; "
+             "heap free=%u largest=%u",
+             (unsigned)HM01B0_CAPTURE_BUFFER_COUNT,
+             (unsigned)handle->transport.buffer_capacity,
+             (unsigned)handle->dma_heap_free_before,
+             (unsigned)handle->dma_heap_largest_before);
 
     for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
+        const size_t free_before_buffer =
+            heap_caps_get_free_size(dma_caps);
+        const size_t largest_before_buffer =
+            heap_caps_get_largest_free_block(dma_caps);
         handle->frames[i].data = esp_cam_ctlr_alloc_buffer(
             handle->cam_handle, handle->transport.buffer_capacity, dma_caps);
         if (handle->frames[i].data == NULL) {
-            ESP_LOGE(TAG, "failed to allocate internal DMA Buffer %c",
-                     (int)('A' + i));
+            ESP_LOGE(TAG,
+                     "failed to allocate internal DMA Buffer %c: "
+                     "required=%u free=%u largest=%u",
+                     (int)('A' + i),
+                     (unsigned)handle->transport.buffer_capacity,
+                     (unsigned)free_before_buffer,
+                     (unsigned)largest_before_buffer);
             ret = ESP_ERR_NO_MEM;
             goto fail;
         }
         handle->frames[i].capacity = handle->transport.buffer_capacity;
+        ESP_LOGI(TAG,
+                 "Buffer %c allocated at %p: required=%u; heap now free=%u "
+                 "largest=%u",
+                 (int)('A' + i), handle->frames[i].data,
+                 (unsigned)handle->transport.buffer_capacity,
+                 (unsigned)heap_caps_get_free_size(dma_caps),
+                 (unsigned)heap_caps_get_largest_free_block(dma_caps));
     }
 
     handle->dma_heap_free_after = heap_caps_get_free_size(dma_caps);

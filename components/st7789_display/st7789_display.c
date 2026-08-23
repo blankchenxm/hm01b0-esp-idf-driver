@@ -23,23 +23,43 @@
 
 #define ST7789_RGB565_BYTES_PER_PIXEL 2U
 #define ST7789_GRAY8_LUT_SIZE         256U
-#define ST7789_SPI_QUEUE_DEPTH        1U
+#define ST7789_SPI_QUEUE_DEPTH        2U
+#define ST7789_STREAM_STRIP_COUNT     2U
+#define ST7789_STREAM_STRIP_HEIGHT    60U
+#define ST7789_PREFLIGHT_BUFFER_ID    UINT8_MAX
+
+typedef struct {
+    SemaphoreHandle_t free;
+    StaticSemaphore_t free_state;
+    uint8_t *data;
+} st7789_strip_buffer_t;
+
+typedef struct {
+    uint8_t buffer_id;
+    bool completes_frame;
+} st7789_pending_transfer_t;
 
 struct st7789_display {
     st7789_display_config_t config;
     esp_lcd_panel_io_handle_t io;
     esp_lcd_panel_handle_t panel;
-    SemaphoreHandle_t buffer_free;
-    StaticSemaphore_t buffer_free_state;
+    SemaphoreHandle_t preflight_free;
+    StaticSemaphore_t preflight_free_state;
+    st7789_strip_buffer_t strips[ST7789_STREAM_STRIP_COUNT];
     portMUX_TYPE stats_lock;
     uint8_t *preflight_line;
     size_t preflight_line_size;
-    uint8_t *rgb_frame;
-    size_t rgb_frame_size;
+    uint8_t *workspace;
+    size_t workspace_size;
+    size_t preflight_capacity;
+    size_t strip_buffer_size;
+    st7789_pending_transfer_t pending[ST7789_SPI_QUEUE_DEPTH];
+    uint8_t pending_head;
+    uint8_t pending_tail;
+    uint8_t pending_count;
     uint16_t rgb565_table[ST7789_GRAY8_LUT_SIZE];
     bool bus_initialized;
     bool stream_prepared;
-    bool transfer_completes_frame;
     int64_t dma_start_us;
     int64_t stats_start_us;
     st7789_display_stats_t stats;
@@ -56,21 +76,38 @@ static bool IRAM_ATTR st7789_color_trans_done(
     (void)event_data;
     st7789_display_handle_t *display = user_ctx;
     const int64_t now_us = esp_timer_get_time();
+    st7789_pending_transfer_t completed = {0};
+    bool have_completed = false;
 
     portENTER_CRITICAL_ISR(&display->stats_lock);
-    if (display->transfer_completes_frame) {
+    if (display->pending_count > 0U) {
+        completed = display->pending[display->pending_head];
+        display->pending_head = (uint8_t)(
+            (display->pending_head + 1U) % ST7789_SPI_QUEUE_DEPTH);
+        display->pending_count--;
+        have_completed = true;
+    } else {
+        display->stats.submit_errors++;
+    }
+    if (have_completed && completed.completes_frame) {
         const uint32_t dma_time_us = (uint32_t)(now_us - display->dma_start_us);
         display->stats.completed_frames++;
         display->stats.last_dma_time_us = dma_time_us;
         if (dma_time_us > display->stats.max_dma_time_us) {
             display->stats.max_dma_time_us = dma_time_us;
         }
+        display->stats.busy = false;
     }
-    display->stats.busy = false;
     portEXIT_CRITICAL_ISR(&display->stats_lock);
 
     BaseType_t task_woken = pdFALSE;
-    xSemaphoreGiveFromISR(display->buffer_free, &task_woken);
+    if (have_completed) {
+        SemaphoreHandle_t free = completed.buffer_id ==
+                                         ST7789_PREFLIGHT_BUFFER_ID
+                                     ? display->preflight_free
+                                     : display->strips[completed.buffer_id].free;
+        xSemaphoreGiveFromISR(free, &task_woken);
+    }
     return task_woken == pdTRUE;
 }
 
@@ -170,24 +207,79 @@ static void st7789_gray8_to_rgb565_be(const uint16_t *rgb565_table,
     }
 }
 
+static SemaphoreHandle_t st7789_get_buffer_semaphore(
+    st7789_display_handle_t *display,
+    uint8_t buffer_id)
+{
+    if (buffer_id == ST7789_PREFLIGHT_BUFFER_ID) {
+        return display->preflight_free;
+    }
+    return buffer_id < ST7789_STREAM_STRIP_COUNT
+               ? display->strips[buffer_id].free
+               : NULL;
+}
+
 static esp_err_t st7789_take_buffer(st7789_display_handle_t *display,
+                                    uint8_t buffer_id,
                                     TickType_t wait_ticks)
 {
-    if (xSemaphoreTake(display->buffer_free, wait_ticks) != pdPASS) {
+    SemaphoreHandle_t free = st7789_get_buffer_semaphore(display, buffer_id);
+    if (free == NULL || xSemaphoreTake(free, wait_ticks) != pdPASS) {
         return ESP_ERR_TIMEOUT;
     }
-    portENTER_CRITICAL(&display->stats_lock);
-    display->stats.busy = true;
-    portEXIT_CRITICAL(&display->stats_lock);
     return ESP_OK;
 }
 
-static void st7789_release_buffer(st7789_display_handle_t *display)
+static void st7789_release_buffer(st7789_display_handle_t *display,
+                                  uint8_t buffer_id)
 {
+    SemaphoreHandle_t free = st7789_get_buffer_semaphore(display, buffer_id);
+    if (free != NULL) {
+        (void)xSemaphoreGive(free);
+    }
+}
+
+static esp_err_t st7789_queue_pending_transfer(
+    st7789_display_handle_t *display,
+    uint8_t buffer_id,
+    bool completes_frame)
+{
+    esp_err_t ret = ESP_OK;
     portENTER_CRITICAL(&display->stats_lock);
-    display->stats.busy = false;
+    if (display->pending_count >= ST7789_SPI_QUEUE_DEPTH) {
+        ret = ESP_ERR_INVALID_STATE;
+    } else {
+        display->pending[display->pending_tail] =
+            (st7789_pending_transfer_t) {
+                .buffer_id = buffer_id,
+                .completes_frame = completes_frame,
+            };
+        display->pending_tail = (uint8_t)(
+            (display->pending_tail + 1U) % ST7789_SPI_QUEUE_DEPTH);
+        display->pending_count++;
+    }
     portEXIT_CRITICAL(&display->stats_lock);
-    (void)xSemaphoreGive(display->buffer_free);
+    return ret;
+}
+
+static bool st7789_rollback_pending_transfer(
+    st7789_display_handle_t *display,
+    uint8_t buffer_id)
+{
+    bool rolled_back = false;
+    portENTER_CRITICAL(&display->stats_lock);
+    if (display->pending_count > 0U) {
+        const uint8_t last = (uint8_t)(
+            (display->pending_tail + ST7789_SPI_QUEUE_DEPTH - 1U) %
+            ST7789_SPI_QUEUE_DEPTH);
+        if (display->pending[last].buffer_id == buffer_id) {
+            display->pending_tail = last;
+            display->pending_count--;
+            rolled_back = true;
+        }
+    }
+    portEXIT_CRITICAL(&display->stats_lock);
+    return rolled_back;
 }
 
 static esp_err_t st7789_submit(st7789_display_handle_t *display,
@@ -196,32 +288,45 @@ static esp_err_t st7789_submit(st7789_display_handle_t *display,
                                uint16_t width,
                                uint16_t height,
                                const uint8_t *rgb565,
-                               bool completes_frame)
+                               uint8_t buffer_id,
+                               bool starts_frame,
+                               bool completes_frame,
+                               uint32_t *elapsed_us)
 {
     const int64_t submit_start_us = esp_timer_get_time();
     portENTER_CRITICAL(&display->stats_lock);
-    display->transfer_completes_frame = completes_frame;
-    if (completes_frame) {
+    if (starts_frame) {
         display->dma_start_us = submit_start_us;
     }
     portEXIT_CRITICAL(&display->stats_lock);
-    const esp_err_t ret = esp_lcd_panel_draw_bitmap(
+
+    esp_err_t ret = st7789_queue_pending_transfer(
+        display, buffer_id, completes_frame);
+    if (ret != ESP_OK) {
+        portENTER_CRITICAL(&display->stats_lock);
+        display->stats.submit_errors++;
+        portEXIT_CRITICAL(&display->stats_lock);
+        st7789_release_buffer(display, buffer_id);
+        return ret;
+    }
+    ret = esp_lcd_panel_draw_bitmap(
         display->panel, x, y, x + width, y + height, rgb565);
     const uint32_t submit_time_us = (uint32_t)(
         esp_timer_get_time() - submit_start_us);
+    if (elapsed_us != NULL) {
+        *elapsed_us = submit_time_us;
+    }
 
     portENTER_CRITICAL(&display->stats_lock);
-    display->stats.last_submit_time_us = submit_time_us;
-    if (submit_time_us > display->stats.max_submit_time_us) {
-        display->stats.max_submit_time_us = submit_time_us;
-    }
     if (ret != ESP_OK) {
         display->stats.submit_errors++;
     }
     portEXIT_CRITICAL(&display->stats_lock);
 
     if (ret != ESP_OK) {
-        st7789_release_buffer(display);
+        if (st7789_rollback_pending_transfer(display, buffer_id)) {
+            st7789_release_buffer(display, buffer_id);
+        }
     }
     return ret;
 }
@@ -243,17 +348,34 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
     display->config = *config;
     display->stats_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
     st7789_init_rgb565_table(display);
-    display->rgb_frame_size = (size_t)config->width * config->height *
-                              ST7789_RGB565_BYTES_PER_PIXEL;
+    display->preflight_capacity = (size_t)config->width * config->height;
+    display->strip_buffer_size =
+        (size_t)config->width * ST7789_STREAM_STRIP_HEIGHT *
+        ST7789_RGB565_BYTES_PER_PIXEL;
+    const size_t strip_workspace_size =
+        display->strip_buffer_size * ST7789_STREAM_STRIP_COUNT;
+    display->workspace_size = display->preflight_capacity >
+                                      strip_workspace_size
+                                  ? display->preflight_capacity
+                                  : strip_workspace_size;
     display->preflight_line_size =
         (size_t)config->width * ST7789_RGB565_BYTES_PER_PIXEL;
-    display->buffer_free = xSemaphoreCreateBinaryStatic(
-        &display->buffer_free_state);
-    if (display->buffer_free == NULL) {
+    display->preflight_free = xSemaphoreCreateBinaryStatic(
+        &display->preflight_free_state);
+    if (display->preflight_free == NULL) {
         free(display);
         return ESP_ERR_NO_MEM;
     }
-    (void)xSemaphoreGive(display->buffer_free);
+    (void)xSemaphoreGive(display->preflight_free);
+    for (size_t i = 0U; i < ST7789_STREAM_STRIP_COUNT; ++i) {
+        display->strips[i].free = xSemaphoreCreateBinaryStatic(
+            &display->strips[i].free_state);
+        if (display->strips[i].free == NULL) {
+            free(display);
+            return ESP_ERR_NO_MEM;
+        }
+        (void)xSemaphoreGive(display->strips[i].free);
+    }
 
     display->preflight_line = heap_caps_malloc(
         display->preflight_line_size,
@@ -268,24 +390,35 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
     const size_t free_before = heap_caps_get_free_size(dma_caps);
     const size_t largest_before =
         heap_caps_get_largest_free_block(dma_caps);
-    display->rgb_frame = heap_caps_malloc(display->rgb_frame_size, dma_caps);
-    if (display->rgb_frame == NULL) {
+    display->workspace = heap_caps_malloc(display->workspace_size, dma_caps);
+    if (display->workspace == NULL) {
         ESP_LOGE(TAG,
-                 "failed to reserve %u-byte internal DMA RGB565 workspace; "
+                 "failed to reserve %u-byte internal DMA shared workspace; "
                  "free=%u largest=%u",
-                 (unsigned)display->rgb_frame_size,
+                 (unsigned)display->workspace_size,
                  (unsigned)free_before, (unsigned)largest_before);
         heap_caps_free(display->preflight_line);
         free(display);
         return ESP_ERR_NO_MEM;
     }
+    for (size_t i = 0U; i < ST7789_STREAM_STRIP_COUNT; ++i) {
+        display->strips[i].data = display->workspace +
+                                  i * display->strip_buffer_size;
+    }
     const size_t free_after = heap_caps_get_free_size(dma_caps);
     const size_t largest_after =
         heap_caps_get_largest_free_block(dma_caps);
     ESP_LOGI(TAG,
-             "reserved RGB565 workspace=%p internal DMA, bytes=%u; heap "
-             "before free=%u largest=%u, after free=%u largest=%u",
-             display->rgb_frame, (unsigned)display->rgb_frame_size,
+             "reserved shared workspace=%p internal DMA, bytes=%u; "
+             "preflight RAW8 capacity=%u, stream strips=%u x %u bytes "
+             "(%ux%u RGB565); heap before free=%u largest=%u, after "
+             "free=%u largest=%u",
+             display->workspace, (unsigned)display->workspace_size,
+             (unsigned)display->preflight_capacity,
+             (unsigned)ST7789_STREAM_STRIP_COUNT,
+             (unsigned)display->strip_buffer_size,
+             (unsigned)config->width,
+             (unsigned)ST7789_STREAM_STRIP_HEIGHT,
              (unsigned)free_before, (unsigned)largest_before,
              (unsigned)free_after, (unsigned)largest_after);
 
@@ -295,7 +428,7 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
         .sclk_io_num = config->clock_gpio,
         .quadwp_io_num = GPIO_NUM_NC,
         .quadhd_io_num = GPIO_NUM_NC,
-        .max_transfer_sz = display->rgb_frame_size,
+        .max_transfer_sz = display->strip_buffer_size,
     };
     esp_err_t ret = spi_bus_initialize(
         config->spi_host, &bus_config, SPI_DMA_CH_AUTO);
@@ -343,9 +476,10 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
     st7789_display_reset_stats(display);
     ESP_LOGI(TAG,
              "ST7789 initialized with esp_lcd (%ux%u RGB565, SPI=%" PRIu32
-             " Hz, max_transfer=%u, gray_lut=%u bytes)",
+             " Hz, queue=%u, max_transfer=%u, gray_lut=%u bytes)",
              config->width, config->height, config->clock_speed_hz,
-             (unsigned)display->rgb_frame_size,
+             (unsigned)ST7789_SPI_QUEUE_DEPTH,
+             (unsigned)display->strip_buffer_size,
              (unsigned)sizeof(display->rgb565_table));
     *out_display = display;
     return ESP_OK;
@@ -381,7 +515,7 @@ esp_err_t st7789_display_delete(st7789_display_handle_t *display)
         }
     }
     heap_caps_free(display->preflight_line);
-    heap_caps_free(display->rgb_frame);
+    heap_caps_free(display->workspace);
     free(display);
     return result;
 }
@@ -411,7 +545,10 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
     portEXIT_CRITICAL(&display->stats_lock);
 
     for (uint16_t row = 0; row < height; ++row) {
-        ESP_RETURN_ON_ERROR(st7789_take_buffer(display, portMAX_DELAY), TAG,
+        ESP_RETURN_ON_ERROR(st7789_take_buffer(
+                                display, ST7789_PREFLIGHT_BUFFER_ID,
+                                portMAX_DELAY),
+                            TAG,
                             "failed to acquire preflight line buffer");
         st7789_gray8_to_rgb565_be(
             display->rgb565_table,
@@ -419,7 +556,8 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
             display->preflight_line, width);
         const esp_err_t ret = st7789_submit(
             display, x, (uint16_t)(y + row), width, 1U,
-            display->preflight_line, row == height - 1U);
+            display->preflight_line, ST7789_PREFLIGHT_BUFFER_ID,
+            row == 0U, row == height - 1U, NULL);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -443,11 +581,15 @@ esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
     }
 
     for (uint16_t row = 0U; row < display->config.height; ++row) {
-        ESP_RETURN_ON_ERROR(st7789_take_buffer(display, portMAX_DELAY), TAG,
+        ESP_RETURN_ON_ERROR(st7789_take_buffer(
+                                display, ST7789_PREFLIGHT_BUFFER_ID,
+                                portMAX_DELAY),
+                            TAG,
                             "failed to acquire clear line buffer");
         const esp_err_t ret = st7789_submit(
             display, 0U, row, display->config.width, 1U,
-            display->preflight_line, row == display->config.height - 1U);
+            display->preflight_line, ST7789_PREFLIGHT_BUFFER_ID,
+            row == 0U, row == display->config.height - 1U, NULL);
         if (ret != ESP_OK) {
             return ret;
         }
@@ -464,11 +606,11 @@ esp_err_t st7789_display_get_preflight_buffer(
                             buffer_size != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
     ESP_RETURN_ON_FALSE(!display->stream_prepared &&
-                            display->rgb_frame != NULL,
+                            display->workspace != NULL,
                         ESP_ERR_INVALID_STATE, TAG,
                         "preflight workspace is unavailable");
-    *buffer = display->rgb_frame;
-    *buffer_size = (size_t)display->config.width * display->config.height;
+    *buffer = display->workspace;
+    *buffer_size = display->preflight_capacity;
     return ESP_OK;
 }
 
@@ -487,10 +629,14 @@ esp_err_t st7789_display_prepare_stream(st7789_display_handle_t *display)
     display->preflight_line_size = 0U;
     display->stream_prepared = true;
     ESP_LOGI(TAG,
-             "RGB565 workspace ended RAW8 preflight use (capacity=%u bytes); "
-             "%u-byte workspace is ready for SPI DMA",
-             (unsigned)((size_t)display->config.width * display->config.height),
-             (unsigned)display->rgb_frame_size);
+             "shared workspace ended RAW8 preflight use (capacity=%u bytes); "
+             "streaming uses Strip A=%p and Strip B=%p, each=%u bytes "
+             "(%ux%u RGB565)",
+             (unsigned)display->preflight_capacity,
+             display->strips[0].data, display->strips[1].data,
+             (unsigned)display->strip_buffer_size,
+             (unsigned)display->config.width,
+             (unsigned)ST7789_STREAM_STRIP_HEIGHT);
     st7789_display_reset_stats(display);
     return ESP_OK;
 }
@@ -511,7 +657,7 @@ esp_err_t st7789_display_try_draw_gray8_frame(
     ESP_RETURN_ON_FALSE(display != NULL && source != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
     ESP_RETURN_ON_FALSE(display->stream_prepared &&
-                            display->rgb_frame != NULL,
+                            display->workspace != NULL,
                         ESP_ERR_INVALID_STATE, TAG,
                         "stream buffer is not prepared");
     ESP_RETURN_ON_FALSE(
@@ -526,59 +672,153 @@ esp_err_t st7789_display_try_draw_gray8_frame(
             height <= display->config.height - destination_y,
         ESP_ERR_INVALID_ARG, TAG, "invalid source/destination rectangle");
 
-    if (st7789_take_buffer(display, 0U) != ESP_OK) {
-        portENTER_CRITICAL(&display->stats_lock);
-        display->stats.dropped_busy++;
-        portEXIT_CRITICAL(&display->stats_lock);
-        return ESP_ERR_TIMEOUT;
+    const uint16_t transfer_count = (uint16_t)(
+        (height + ST7789_STREAM_STRIP_HEIGHT - 1U) /
+        ST7789_STREAM_STRIP_HEIGHT);
+    const uint8_t initial_buffer_count =
+        transfer_count < ST7789_STREAM_STRIP_COUNT
+            ? (uint8_t)transfer_count
+            : ST7789_STREAM_STRIP_COUNT;
+    bool buffer_held[ST7789_STREAM_STRIP_COUNT] = {false};
+    for (uint8_t i = 0U; i < initial_buffer_count; ++i) {
+        if (st7789_take_buffer(display, i, 0U) != ESP_OK) {
+            for (uint8_t acquired = 0U; acquired < i; ++acquired) {
+                st7789_release_buffer(display, acquired);
+            }
+            portENTER_CRITICAL(&display->stats_lock);
+            display->stats.dropped_busy++;
+            portEXIT_CRITICAL(&display->stats_lock);
+            return ESP_ERR_TIMEOUT;
+        }
+        buffer_held[i] = true;
     }
-
-    const int64_t convert_start_us = esp_timer_get_time();
-    for (uint16_t row = 0; row < height; ++row) {
-        const uint8_t *source_row =
-            source + (size_t)(source_y + row) * source_stride + source_x;
-        uint8_t *destination_row =
-            display->rgb_frame +
-            (size_t)row * width *
-                ST7789_RGB565_BYTES_PER_PIXEL;
-        st7789_gray8_to_rgb565_be(
-            display->rgb565_table,
-            source_row, destination_row, width);
-    }
-    const uint32_t convert_time_us = (uint32_t)(
-        esp_timer_get_time() - convert_start_us);
 
     portENTER_CRITICAL(&display->stats_lock);
-    display->stats.last_convert_time_us = convert_time_us;
-    if (convert_time_us > display->stats.max_convert_time_us) {
-        display->stats.max_convert_time_us = convert_time_us;
-    }
+    display->stats.busy = true;
     portEXIT_CRITICAL(&display->stats_lock);
 
-    const esp_err_t ret = st7789_submit(
-        display, destination_x, destination_y, width, height,
-        display->rgb_frame, true);
-    if (ret == ESP_OK) {
-        portENTER_CRITICAL(&display->stats_lock);
-        display->stats.submitted_frames++;
-        portEXIT_CRITICAL(&display->stats_lock);
+    uint32_t total_convert_time_us = 0U;
+    uint32_t total_submit_time_us = 0U;
+    esp_err_t ret = ESP_OK;
+    /*
+     * A submitted Strip belongs to SPI DMA until its callback gives the
+     * matching semaphore. CPU conversion then proceeds in the other Strip.
+     * Taking the same Strip before its next use is the ownership hand-off that
+     * prevents overwriting bytes still being transmitted.
+     */
+    for (uint16_t transfer = 0U; transfer < transfer_count; ++transfer) {
+        const uint8_t buffer_id = (uint8_t)(
+            transfer % ST7789_STREAM_STRIP_COUNT);
+        if (!buffer_held[buffer_id]) {
+            ret = st7789_take_buffer(display, buffer_id, portMAX_DELAY);
+            if (ret != ESP_OK) {
+                break;
+            }
+            buffer_held[buffer_id] = true;
+        }
+
+        const uint16_t first_row = (uint16_t)(
+            transfer * ST7789_STREAM_STRIP_HEIGHT);
+        const uint16_t remaining_rows = (uint16_t)(height - first_row);
+        const uint16_t rows = remaining_rows < ST7789_STREAM_STRIP_HEIGHT
+                                  ? remaining_rows
+                                  : ST7789_STREAM_STRIP_HEIGHT;
+
+        const int64_t convert_start_us = esp_timer_get_time();
+        for (uint16_t row = 0U; row < rows; ++row) {
+            const uint8_t *source_row =
+                source + (size_t)(source_y + first_row + row) *
+                             source_stride +
+                source_x;
+            uint8_t *destination_row =
+                display->strips[buffer_id].data +
+                (size_t)row * width * ST7789_RGB565_BYTES_PER_PIXEL;
+            st7789_gray8_to_rgb565_be(
+                display->rgb565_table,
+                source_row, destination_row, width);
+        }
+        total_convert_time_us += (uint32_t)(
+            esp_timer_get_time() - convert_start_us);
+
+        uint32_t submit_time_us = 0U;
+        ret = st7789_submit(
+            display, destination_x,
+            (uint16_t)(destination_y + first_row), width, rows,
+            display->strips[buffer_id].data, buffer_id,
+            transfer == 0U, transfer == transfer_count - 1U,
+            &submit_time_us);
+        buffer_held[buffer_id] = false;
+        total_submit_time_us += submit_time_us;
+        if (ret != ESP_OK) {
+            break;
+        }
     }
+
+    for (uint8_t i = 0U; i < ST7789_STREAM_STRIP_COUNT; ++i) {
+        if (buffer_held[i]) {
+            st7789_release_buffer(display, i);
+        }
+    }
+
+    portENTER_CRITICAL(&display->stats_lock);
+    display->stats.last_convert_time_us = total_convert_time_us;
+    if (total_convert_time_us > display->stats.max_convert_time_us) {
+        display->stats.max_convert_time_us = total_convert_time_us;
+    }
+    display->stats.last_submit_time_us = total_submit_time_us;
+    if (total_submit_time_us > display->stats.max_submit_time_us) {
+        display->stats.max_submit_time_us = total_submit_time_us;
+    }
+    if (ret == ESP_OK) {
+        display->stats.submitted_frames++;
+    } else {
+        display->stats.busy = false;
+    }
+    portEXIT_CRITICAL(&display->stats_lock);
     return ret;
+}
+
+static esp_err_t st7789_wait_semaphore(SemaphoreHandle_t semaphore,
+                                       TickType_t wait_ticks)
+{
+    if (semaphore == NULL) {
+        return ESP_OK;
+    }
+    if (xSemaphoreTake(semaphore, wait_ticks) != pdPASS) {
+        return ESP_ERR_TIMEOUT;
+    }
+    (void)xSemaphoreGive(semaphore);
+    return ESP_OK;
 }
 
 esp_err_t st7789_display_wait_idle(st7789_display_handle_t *display,
                                   uint32_t timeout_ms)
 {
-    if (display == NULL || display->buffer_free == NULL) {
+    if (display == NULL) {
         return ESP_OK;
     }
     const TickType_t wait_ticks = timeout_ms == UINT32_MAX
                                       ? portMAX_DELAY
                                       : pdMS_TO_TICKS(timeout_ms);
-    if (xSemaphoreTake(display->buffer_free, wait_ticks) != pdPASS) {
-        return ESP_ERR_TIMEOUT;
+    if (!display->stream_prepared) {
+        return st7789_wait_semaphore(display->preflight_free, wait_ticks);
     }
-    (void)xSemaphoreGive(display->buffer_free);
+
+    bool acquired[ST7789_STREAM_STRIP_COUNT] = {false};
+    for (uint8_t i = 0U; i < ST7789_STREAM_STRIP_COUNT; ++i) {
+        if (xSemaphoreTake(display->strips[i].free, wait_ticks) != pdPASS) {
+            for (uint8_t release = 0U; release < i; ++release) {
+                if (acquired[release]) {
+                    (void)xSemaphoreGive(display->strips[release].free);
+                }
+            }
+            return ESP_ERR_TIMEOUT;
+        }
+        acquired[i] = true;
+    }
+    for (uint8_t i = 0U; i < ST7789_STREAM_STRIP_COUNT; ++i) {
+        (void)xSemaphoreGive(display->strips[i].free);
+    }
     return ESP_OK;
 }
 
@@ -589,11 +829,13 @@ void st7789_display_reset_stats(st7789_display_handle_t *display)
     }
     portENTER_CRITICAL(&display->stats_lock);
     const bool busy = display->stats.busy;
-    const size_t frame_buffer_size = display->rgb_frame != NULL
-                                         ? display->rgb_frame_size
-                                         : 0U;
     display->stats = (st7789_display_stats_t) {
-        .frame_buffer_size = frame_buffer_size,
+        .frame_buffer_size = display->workspace != NULL
+                                 ? display->workspace_size
+                                 : 0U,
+        .strip_buffer_size = display->strip_buffer_size,
+        .strip_height = ST7789_STREAM_STRIP_HEIGHT,
+        .strip_buffer_count = ST7789_STREAM_STRIP_COUNT,
         .busy = busy,
     };
     display->stats_start_us = esp_timer_get_time();

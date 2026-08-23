@@ -109,11 +109,14 @@ static void hm01b0_log_live_display_stats(void)
              "display timing: convert(last=%" PRIu32 "us,max=%" PRIu32
              "us) submit(last=%" PRIu32 "us,max=%" PRIu32
              "us) dma(last=%" PRIu32 "us,max=%" PRIu32
-             "us) rgb_buffer=%u bytes",
+             "us) workspace=%u bytes strips=%u x %u bytes (%u rows)",
              stats.last_convert_time_us, stats.max_convert_time_us,
              stats.last_submit_time_us, stats.max_submit_time_us,
              stats.last_dma_time_us, stats.max_dma_time_us,
-             (unsigned)stats.frame_buffer_size);
+             (unsigned)stats.frame_buffer_size,
+             (unsigned)stats.strip_buffer_count,
+             (unsigned)stats.strip_buffer_size,
+             (unsigned)stats.strip_height);
 }
 
 static void hm01b0_log_preflight_result(
@@ -472,10 +475,31 @@ void app_main(void)
     s_snapshot = NULL;
     ret = st7789_display_prepare_stream(s_display);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to prepare RGB565 stream buffer: %s",
+        ESP_LOGE(TAG, "failed to prepare RGB565 Strip workspace: %s",
                  esp_err_to_name(ret));
         goto fail;
     }
+    st7789_display_stats_t display_layout = {0};
+    ret = st7789_display_get_stats(s_display, &display_layout);
+    if (ret != ESP_OK || display_layout.strip_height == 0U) {
+        if (ret == ESP_OK) {
+            ret = ESP_ERR_INVALID_STATE;
+        }
+        ESP_LOGE(TAG, "failed to read Strip layout: %s",
+                 esp_err_to_name(ret));
+        goto fail;
+    }
+    const uint16_t transfers_per_frame = (uint16_t)(
+        (s_mode_profile.display_source.height +
+         display_layout.strip_height - 1U) /
+        display_layout.strip_height);
+    ESP_LOGI(TAG,
+             "display pipeline: workspace=%u bytes, Strip A/B=%u bytes "
+             "each, strip_height=%u, transfers_per_frame=%u",
+             (unsigned)display_layout.frame_buffer_size,
+             (unsigned)display_layout.strip_buffer_size,
+             (unsigned)display_layout.strip_height,
+             (unsigned)transfers_per_frame);
     ret = hm01b0_capture_set_frame_consumer(
         s_capture, hm01b0_live_frame_ready, s_display);
     if (ret != ESP_OK) {
@@ -503,7 +527,8 @@ void app_main(void)
     ESP_LOGI(TAG,
              "Stage 6 running: test pattern OFF, HM01B0 %s RAW8 %ux%u "
              "streaming; source=(%u,%u %ux%u), destination=(%u,%u), "
-             "ST7789=%ux%u RGB565 over esp_lcd SPI DMA",
+             "ST7789=%ux%u RGB565 over esp_lcd SPI DMA using alternating "
+             "Strip Buffers",
              s_mode_profile.name,
              (unsigned)s_mode_profile.sensor.transport_width,
              (unsigned)s_mode_profile.sensor.transport_height,
