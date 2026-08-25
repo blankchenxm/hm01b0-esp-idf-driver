@@ -115,6 +115,20 @@ static bool hm01b0_capture_rect_is_valid(
            rect.height <= handle->config.frame_height - rect.y;
 }
 
+static bool hm01b0_capture_frame_size_is_valid(
+    const hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame)
+{
+    /*
+     * RAW8 pixels occupy the first payload_size bytes. esp_driver_cam may
+     * align its non-JPEG DMA transaction to a cache/DMA boundary and report
+     * the resulting capacity as received_size. Bytes after payload_size are
+     * trailing transport padding, not pixels and not part of the row stride.
+     */
+    return frame->received_size >= handle->transport.payload_size &&
+           frame->received_size <= handle->transport.buffer_capacity;
+}
+
 static esp_err_t hm01b0_capture_validate_config(
     const hm01b0_capture_config_t *config)
 {
@@ -165,6 +179,9 @@ static void hm01b0_capture_reset_session(hm01b0_capture_handle_t *handle)
         .payload_size = (size_t)handle->config.frame_width *
                         handle->config.frame_height,
         .buffer_capacity = capacity,
+        .dma_padding_size =
+            capacity - (size_t)handle->config.frame_width *
+                           handle->config.frame_height,
     };
     handle->diagnostic_report = (hm01b0_diagnostic_report_t) {
         .pattern = handle->diagnostic_enabled
@@ -354,6 +371,7 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
     ESP_LOGI(TAG,
              "fps=%" PRIu32 ".%03" PRIu32 " received=%" PRIu32
              " valid=%" PRIu32 " size_err=%" PRIu32
+             " size_change=%" PRIu32
              " no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
              " free_err=%" PRIu32,
              handle->transport.fps_milli / 1000U,
@@ -361,6 +379,7 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
              handle->transport.frames_received,
              handle->transport.valid_frames,
              handle->transport.size_errors,
+             handle->transport.received_size_changes,
              handle->transport.no_free_buffer,
              handle->transport.ready_queue_overflows,
              handle->transport.free_queue_errors);
@@ -440,7 +459,7 @@ static void hm01b0_capture_process_transport(
     bool *size_valid)
 {
     handle->transport.last_received_size = frame->received_size;
-    *size_valid = frame->received_size == handle->transport.payload_size;
+    *size_valid = hm01b0_capture_frame_size_is_valid(handle, frame);
 
     if (!handle->baseline_received_size_valid) {
         handle->baseline_received_size = frame->received_size;
@@ -455,8 +474,9 @@ static void hm01b0_capture_process_transport(
         handle->transport.size_errors++;
         if (hm01b0_capture_error_log_allowed(handle, now_us)) {
             ESP_LOGE(TAG,
-                     "frame=%" PRIu32 " size error: received=%u payload=%u "
-                     "capacity=%u",
+                     "frame=%" PRIu32
+                     " transaction size error: received=%u "
+                     "logical_payload=%u dma_capacity=%u",
                      frame->sequence, (unsigned)frame->received_size,
                      (unsigned)handle->transport.payload_size,
                      (unsigned)handle->transport.buffer_capacity);
@@ -658,13 +678,15 @@ static void hm01b0_capture_log_memory(const hm01b0_capture_handle_t *handle)
              (unsigned)handle->dma_heap_free_after,
              (unsigned)handle->dma_heap_largest_after);
     ESP_LOGI(TAG,
-             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, payload=%u bytes",
+             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, "
+             "logical_payload=%u bytes, dma_padding=%u bytes",
              handle->frames[0].data,
              esp_ptr_internal(handle->frames[0].data) ? "internal" : "external",
              handle->frames[1].data,
              esp_ptr_internal(handle->frames[1].data) ? "internal" : "external",
              (unsigned)handle->transport.buffer_capacity,
-             (unsigned)handle->transport.payload_size);
+             (unsigned)handle->transport.payload_size,
+             (unsigned)handle->transport.dma_padding_size);
 }
 
 esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
@@ -737,6 +759,8 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         ret = ESP_ERR_INVALID_SIZE;
         goto fail;
     }
+    handle->transport.dma_padding_size =
+        handle->transport.buffer_capacity - handle->transport.payload_size;
 
     const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
     handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
@@ -768,6 +792,7 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
             ret = ESP_ERR_NO_MEM;
             goto fail;
         }
+        handle->frames[i].payload_size = handle->transport.payload_size;
         handle->frames[i].capacity = handle->transport.buffer_capacity;
         ESP_LOGI(TAG,
                  "Buffer %c allocated at %p: required=%u; heap now free=%u "
@@ -818,11 +843,13 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     }
 
     ESP_LOGI(TAG,
-             "DVP ready: RAW8 %ux%u, payload=%u, capacity=%u, burst=%" PRIu32
+             "DVP ready: RAW8 %ux%u, logical_payload=%u, dma_capacity=%u, "
+             "dma_padding=%u, burst=%" PRIu32
              ", buffers=2, backup=disabled",
              config->frame_width, config->frame_height,
              (unsigned)handle->transport.payload_size,
              (unsigned)handle->transport.buffer_capacity,
+             (unsigned)handle->transport.dma_padding_size,
              config->dma_burst_size);
     hm01b0_capture_log_memory(handle);
     *out_handle = handle;
