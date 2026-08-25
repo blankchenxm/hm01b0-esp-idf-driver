@@ -112,11 +112,27 @@ static const char *hm01b0_capture_buffer_memory_name(
                : "internal DMA";
 }
 
-static uint32_t hm01b0_capture_buffer_caps(
+static uint32_t hm01b0_capture_buffer_alloc_caps(
     hm01b0_capture_buffer_memory_t memory)
 {
     return memory == HM01B0_CAPTURE_BUFFER_PSRAM
                ? MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA
+               : MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+}
+
+static uint32_t hm01b0_capture_buffer_heap_caps(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    /*
+     * ESP-IDF's allocator accepts MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA and
+     * converts the DMA flag into the external-memory alignment requirement
+     * before selecting a heap.  The heap information APIs do not perform
+     * that conversion, because the PSRAM heap itself is advertised only as
+     * MALLOC_CAP_SPIRAM.  Query the underlying heap with its advertised caps
+     * while retaining SPIRAM | DMA for the actual Camera buffer allocation.
+     */
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? MALLOC_CAP_SPIRAM
                : MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
 }
 
@@ -725,15 +741,17 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
                         "failed to allocate capture context");
     handle->config = *config;
 
-    const uint32_t dma_caps = hm01b0_capture_buffer_caps(
+    const uint32_t buffer_alloc_caps = hm01b0_capture_buffer_alloc_caps(
+        config->buffer_memory);
+    const uint32_t buffer_heap_caps = hm01b0_capture_buffer_heap_caps(
         config->buffer_memory);
     const char *buffer_memory_name = hm01b0_capture_buffer_memory_name(
         config->buffer_memory);
     esp_err_t ret = ESP_OK;
     if (config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM &&
-        heap_caps_get_total_size(dma_caps) == 0U) {
+        heap_caps_get_total_size(buffer_heap_caps) == 0U) {
         ESP_LOGE(TAG,
-                 "PSRAM DMA heap is unavailable; enable PSRAM and expose it "
+                 "PSRAM heap is unavailable; enable PSRAM and expose it "
                  "through the capability allocator");
         ret = ESP_ERR_NOT_SUPPORTED;
         goto fail;
@@ -797,9 +815,9 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     handle->transport.dma_padding_size =
         handle->transport.buffer_capacity - handle->transport.payload_size;
 
-    handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
+    handle->dma_heap_free_before = heap_caps_get_free_size(buffer_heap_caps);
     handle->dma_heap_largest_before =
-        heap_caps_get_largest_free_block(dma_caps);
+        heap_caps_get_largest_free_block(buffer_heap_caps);
     ESP_LOGI(TAG,
              "allocating %u Camera Buffers, each=%u bytes in %s; "
              "heap free=%u largest=%u",
@@ -811,11 +829,12 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
 
     for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
         const size_t free_before_buffer =
-            heap_caps_get_free_size(dma_caps);
+            heap_caps_get_free_size(buffer_heap_caps);
         const size_t largest_before_buffer =
-            heap_caps_get_largest_free_block(dma_caps);
+            heap_caps_get_largest_free_block(buffer_heap_caps);
         handle->frames[i].data = esp_cam_ctlr_alloc_buffer(
-            handle->cam_handle, handle->transport.buffer_capacity, dma_caps);
+            handle->cam_handle, handle->transport.buffer_capacity,
+            buffer_alloc_caps);
         if (handle->frames[i].data == NULL) {
             ESP_LOGE(TAG,
                      "failed to allocate %s Buffer %c: "
@@ -845,13 +864,13 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
                  "largest=%u",
                  (int)('A' + i), handle->frames[i].data,
                  (unsigned)handle->transport.buffer_capacity,
-                 (unsigned)heap_caps_get_free_size(dma_caps),
-                 (unsigned)heap_caps_get_largest_free_block(dma_caps));
+                 (unsigned)heap_caps_get_free_size(buffer_heap_caps),
+                 (unsigned)heap_caps_get_largest_free_block(buffer_heap_caps));
     }
 
-    handle->dma_heap_free_after = heap_caps_get_free_size(dma_caps);
+    handle->dma_heap_free_after = heap_caps_get_free_size(buffer_heap_caps);
     handle->dma_heap_largest_after =
-        heap_caps_get_largest_free_block(dma_caps);
+        heap_caps_get_largest_free_block(buffer_heap_caps);
 
     handle->free_queue = xQueueCreateStatic(
         HM01B0_CAPTURE_BUFFER_COUNT, sizeof(hm01b0_capture_frame_t *),
