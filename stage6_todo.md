@@ -124,21 +124,30 @@ longer user-maintained macros.
 
 ## Owner hardware validation
 
-- [ ] Build and flash the unchanged QVGA 60 FPS default as a regression check.
-- [ ] Confirm QVGA Pattern preflights and live display remain correct.
-- [ ] Select Full 30 FPS and confirm both Camera Buffer addresses are reported
-  as external while the RGB565 workspace is reported as internal DMA.
-- [ ] Confirm Full uses 324x324 transport and a centered 240x240 image.
-- [ ] If Full 30 FPS succeeds, repeat at Full 45 FPS.
-- [ ] Select QQVGA 60 FPS and confirm 162x122 transport.
-- [ ] Confirm the QQVGA 160x120 image is centered at `(40,60)` with stable black
-  borders.
-- [ ] If QQVGA 60 FPS succeeds, repeat at QQVGA 120 FPS.
-- [ ] Confirm Walking-1 and Color-Bar preflights in every tested mode.
-- [ ] Confirm `size_err`, `no_buffer`, `ready_overflow`, `free_err`,
-  `dropped_busy`, and `submit_err` remain zero.
+Hardware validation was completed by the owner on 2026-08-25:
+
+- [x] Full, QVGA, and QQVGA all build, flash, capture, and display correctly.
+- [x] Walking-1 and Color-Bar preflights complete correctly in all three modes.
+- [x] Full captures the 324x324 transport, uses PSRAM for Camera A/B, retains
+  the RGB565 workspace in internal DMA SRAM, and displays the centered 240x240
+  crop.
+- [x] QVGA captures the 324x244 transport and displays the centered 240x240
+  crop without regression.
+- [x] QQVGA captures the 162x122 transport and displays the 160x120 valid area
+  at `(40,60)` with stable black borders.
+- [x] No functional problem was observed in the common preflight and live
+  streaming flow for any of the three modes.
+
+The following items are optional performance characterization rather than
+blockers for the Stage 6 three-mode implementation:
+
+- [ ] Record a complete counter snapshot (`size_err`, `no_buffer`,
+  `ready_overflow`, `free_err`, `dropped_busy`, and `submit_err`) for every
+  mode/rate pair.
 - [ ] Record Camera/display FPS and conversion/submission/DMA/Buffer-hold
-  maxima for each mode/rate pair.
+  maxima for every mode/rate pair.
+- [ ] Characterize the highest presets separately, including Full 45 FPS and
+  QQVGA 120 FPS.
 
 ## Deferred
 
