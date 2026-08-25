@@ -104,6 +104,22 @@ static bool hm01b0_capture_valid_dma_burst(uint32_t burst_size)
             (burst_size & (burst_size - 1U)) == 0U);
 }
 
+static const char *hm01b0_capture_buffer_memory_name(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? "PSRAM DMA"
+               : "internal DMA";
+}
+
+static uint32_t hm01b0_capture_buffer_caps(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA
+               : MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+}
+
 static bool hm01b0_capture_rect_is_valid(
     const hm01b0_capture_handle_t *handle,
     hm01b0_frame_rect_t rect)
@@ -137,6 +153,10 @@ static esp_err_t hm01b0_capture_validate_config(
     ESP_RETURN_ON_FALSE(config->frame_width > 0U &&
                         config->frame_height > 0U,
                         ESP_ERR_INVALID_ARG, TAG, "invalid frame geometry");
+    ESP_RETURN_ON_FALSE(
+        config->buffer_memory == HM01B0_CAPTURE_BUFFER_INTERNAL ||
+            config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM,
+        ESP_ERR_INVALID_ARG, TAG, "invalid Camera buffer memory selection");
     ESP_RETURN_ON_FALSE(GPIO_IS_VALID_GPIO(config->pclk_gpio) &&
                         GPIO_IS_VALID_GPIO(config->vsync_gpio) &&
                         GPIO_IS_VALID_GPIO(config->de_gpio),
@@ -671,8 +691,9 @@ static void hm01b0_capture_task(void *arg)
 static void hm01b0_capture_log_memory(const hm01b0_capture_handle_t *handle)
 {
     ESP_LOGI(TAG,
-             "internal DMA heap before: free=%u largest=%u; after: free=%u "
-             "largest=%u",
+             "%s heap before: free=%u largest=%u; after: free=%u largest=%u",
+             hm01b0_capture_buffer_memory_name(
+                 handle->config.buffer_memory),
              (unsigned)handle->dma_heap_free_before,
              (unsigned)handle->dma_heap_largest_before,
              (unsigned)handle->dma_heap_free_after,
@@ -703,6 +724,20 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_NO_MEM, TAG,
                         "failed to allocate capture context");
     handle->config = *config;
+
+    const uint32_t dma_caps = hm01b0_capture_buffer_caps(
+        config->buffer_memory);
+    const char *buffer_memory_name = hm01b0_capture_buffer_memory_name(
+        config->buffer_memory);
+    esp_err_t ret = ESP_OK;
+    if (config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM &&
+        heap_caps_get_total_size(dma_caps) == 0U) {
+        ESP_LOGE(TAG,
+                 "PSRAM DMA heap is unavailable; enable PSRAM and expose it "
+                 "through the capability allocator");
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto fail;
+    }
 
     const esp_cam_ctlr_dvp_pin_config_t pin_config = {
         .data_width = CAM_CTLR_DATA_WIDTH_8,
@@ -735,7 +770,7 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         .pin = &pin_config,
     };
 
-    esp_err_t ret = esp_cam_new_dvp_ctlr(&dvp_config, &handle->cam_handle);
+    ret = esp_cam_new_dvp_ctlr(&dvp_config, &handle->cam_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to create DVP controller: %s",
                  esp_err_to_name(ret));
@@ -762,15 +797,15 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     handle->transport.dma_padding_size =
         handle->transport.buffer_capacity - handle->transport.payload_size;
 
-    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
     handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
     handle->dma_heap_largest_before =
         heap_caps_get_largest_free_block(dma_caps);
     ESP_LOGI(TAG,
-             "allocating %u Camera Buffers, each=%u bytes internal DMA; "
+             "allocating %u Camera Buffers, each=%u bytes in %s; "
              "heap free=%u largest=%u",
              (unsigned)HM01B0_CAPTURE_BUFFER_COUNT,
              (unsigned)handle->transport.buffer_capacity,
+             buffer_memory_name,
              (unsigned)handle->dma_heap_free_before,
              (unsigned)handle->dma_heap_largest_before);
 
@@ -783,13 +818,24 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
             handle->cam_handle, handle->transport.buffer_capacity, dma_caps);
         if (handle->frames[i].data == NULL) {
             ESP_LOGE(TAG,
-                     "failed to allocate internal DMA Buffer %c: "
+                     "failed to allocate %s Buffer %c: "
                      "required=%u free=%u largest=%u",
+                     buffer_memory_name,
                      (int)('A' + i),
                      (unsigned)handle->transport.buffer_capacity,
                      (unsigned)free_before_buffer,
                      (unsigned)largest_before_buffer);
             ret = ESP_ERR_NO_MEM;
+            goto fail;
+        }
+        const bool location_valid =
+            config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM
+                ? esp_ptr_external_ram(handle->frames[i].data)
+                : esp_ptr_internal(handle->frames[i].data);
+        if (!location_valid) {
+            ESP_LOGE(TAG, "Buffer %c was not allocated in %s",
+                     (int)('A' + i), buffer_memory_name);
+            ret = ESP_ERR_INVALID_STATE;
             goto fail;
         }
         handle->frames[i].payload_size = handle->transport.payload_size;
@@ -845,12 +891,12 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     ESP_LOGI(TAG,
              "DVP ready: RAW8 %ux%u, logical_payload=%u, dma_capacity=%u, "
              "dma_padding=%u, burst=%" PRIu32
-             ", buffers=2, backup=disabled",
+             ", buffers=2, camera_memory=%s, backup=disabled",
              config->frame_width, config->frame_height,
              (unsigned)handle->transport.payload_size,
              (unsigned)handle->transport.buffer_capacity,
              (unsigned)handle->transport.dma_padding_size,
-             config->dma_burst_size);
+             config->dma_burst_size, buffer_memory_name);
     hm01b0_capture_log_memory(handle);
     *out_handle = handle;
     return ESP_OK;

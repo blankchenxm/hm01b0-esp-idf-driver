@@ -433,6 +433,10 @@ void app_main(void)
         .frame_width = s_mode_profile.sensor.transport_width,
         .frame_height = s_mode_profile.sensor.transport_height,
         .dma_burst_size = APP_CAPTURE_DMA_BURST_SIZE,
+        .buffer_memory =
+            APP_HM01B0_MODE == HM01B0_SENSOR_MODE_FULL
+                ? HM01B0_CAPTURE_BUFFER_PSRAM
+                : HM01B0_CAPTURE_BUFFER_INTERNAL,
     };
     ret = hm01b0_capture_new(&capture_config, &s_capture);
     if (ret != ESP_OK) {

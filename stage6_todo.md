@@ -46,20 +46,22 @@ available for RGB565 conversion and SPI DMA. Full and QVGA submit 115,200 bytes
 per displayed frame; QQVGA packs and submits only 38,400 bytes from the
 beginning of the same workspace.
 
-Camera A/B continue to contain complete uncropped DVP frames:
+Camera A/B continue to contain complete uncropped DVP frames. Full places the
+two large Camera buffers in DMA-capable PSRAM; QVGA and QQVGA keep their
+validated internal-DMA allocation. The complete RGB565 display workspace stays
+in internal DMA SRAM for every mode:
 
-| Mode | RAW8 payload per Camera Buffer | Two-Buffer payload |
-|---|---:|---:|
-| Full | 104,976 bytes | 209,952 bytes |
-| QVGA | 79,056 bytes | 158,112 bytes |
-| QQVGA | 19,764 bytes | 39,528 bytes |
+| Mode | Camera A/B memory | RAW8 payload per buffer | RGB565 memory |
+|---|---|---:|---|
+| Full | DMA-capable PSRAM | 104,976 bytes | Internal DMA SRAM |
+| QVGA | Internal DMA SRAM | 79,056 bytes | Internal DMA SRAM |
+| QQVGA | Internal DMA SRAM | 19,764 bytes | Internal DMA SRAM |
 
 Actual allocation capacity is still reported by
-`esp_cam_ctlr_get_frame_buffer_len()` and may include driver requirements.
-Full deliberately keeps the complete RGB565 workspace for the first hardware
-test. If internal DMA Heap or its largest continuous block is insufficient, the
-existing allocation diagnostics must fail cleanly before strip buffering,
-PSRAM, or another architecture is considered.
+`esp_cam_ctlr_get_frame_buffer_len()` and may include trailing DMA/cache
+alignment padding. The allocation API verifies that each returned address is
+in the requested memory pool. Full fails clearly if DMA-capable PSRAM is not
+enabled or exposed through the capability allocator.
 
 ## Frame-rate policy
 
@@ -114,6 +116,9 @@ longer user-maintained macros.
 - [x] Generalize live RGB565 submission to a rectangular panel destination.
 - [x] Clear the panel to black before QQVGA partial updates.
 - [x] Reuse one RGB565 workspace for all preflight Snapshots.
+- [x] Place Full Camera A/B in PSRAM while retaining the RGB565 workspace in
+  internal DMA SRAM.
+- [x] Keep QVGA and QQVGA Camera A/B in internal DMA SRAM.
 - [x] Remove fixed QVGA crop macros and QVGA-only runtime logs.
 - [x] Keep QVGA 60 FPS as the default configuration.
 
@@ -121,8 +126,8 @@ longer user-maintained macros.
 
 - [ ] Build and flash the unchanged QVGA 60 FPS default as a regression check.
 - [ ] Confirm QVGA Pattern preflights and live display remain correct.
-- [ ] Select Full 30 FPS and record both Camera Buffer allocations and Heap
-  diagnostics.
+- [ ] Select Full 30 FPS and confirm both Camera Buffer addresses are reported
+  as external while the RGB565 workspace is reported as internal DMA.
 - [ ] Confirm Full uses 324x324 transport and a centered 240x240 image.
 - [ ] If Full 30 FPS succeeds, repeat at Full 45 FPS.
 - [ ] Select QQVGA 60 FPS and confirm 162x122 transport.
@@ -139,6 +144,5 @@ longer user-maintained macros.
 
 - [ ] Runtime mode switching without recreating Camera resources.
 - [ ] QQVGA scaling to 240x180 or 240x240.
-- [ ] Full-mode strip Buffer fallback if the complete-buffer allocation fails.
-- [ ] A second RGB565 Buffer, a third Camera Buffer, or PSRAM.
+- [ ] A second RGB565 Buffer or a third Camera Buffer.
 - [ ] QQVGA presets above 120 FPS.
