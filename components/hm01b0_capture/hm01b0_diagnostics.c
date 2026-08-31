@@ -150,9 +150,13 @@ static hm01b0_walking_1_result_t hm01b0_analyze_walking_1(
 static hm01b0_color_bar_result_t hm01b0_analyze_color_bar(
     const uint8_t *data,
     size_t stride,
-    hm01b0_frame_rect_t area)
+    hm01b0_frame_rect_t area,
+    hm01b0_pixel_format_t pixel_format)
 {
     hm01b0_color_bar_result_t result = { .min_value = UINT8_MAX };
+    const bool is_bayer = pixel_format != HM01B0_PIXEL_FORMAT_MONO8;
+    const uint16_t sample_step = is_bayer ? 2U : 1U;
+    result.cfa_aware = is_bayer;
     uint32_t seen_values[8] = {0};
     uint16_t rows[HM01B0_DIAGNOSTIC_SAMPLE_ROW_COUNT] = {0};
     uint16_t centers[HM01B0_DIAGNOSTIC_COLOR_BAR_COUNT] = {0};
@@ -160,13 +164,13 @@ static hm01b0_color_bar_result_t hm01b0_analyze_color_bar(
     result.sampled_rows = (uint32_t)row_count;
 
     const uint8_t *reference = data + (size_t)rows[0] * stride + area.x;
-    for (uint16_t x = 1U; x < area.width; ++x) {
-        if (reference[x] != reference[x - 1U]) {
+    for (uint16_t x = sample_step; x < area.width; ++x) {
+        if (reference[x] != reference[x - sample_step]) {
             result.horizontal_transitions++;
         }
-        const unsigned delta = reference[x] > reference[x - 1U]
-                                   ? reference[x] - reference[x - 1U]
-                                   : reference[x - 1U] - reference[x];
+        const unsigned delta = reference[x] > reference[x - sample_step]
+                                   ? reference[x] - reference[x - sample_step]
+                                   : reference[x - sample_step] - reference[x];
         if (delta >= HM01B0_COLOR_BAR_STRONG_DELTA) {
             result.strong_transitions++;
         }
@@ -204,12 +208,15 @@ static hm01b0_color_bar_result_t hm01b0_analyze_color_bar(
             if (value > result.max_value) {
                 result.max_value = value;
             }
-            if (row_index > 0U && value != reference[x]) {
+            if (row_index > 0U &&
+                (!is_bayer || ((rows[row_index] - rows[0]) & 1U) == 0U) &&
+                value != reference[x]) {
                 result.vertical_mismatches++;
                 equal = false;
             }
         }
-        if (row_index > 0U) {
+        if (row_index > 0U &&
+            (!is_bayer || ((rows[row_index] - rows[0]) & 1U) == 0U)) {
             result.rows_compared++;
             if (equal) {
                 result.rows_equal++;
@@ -227,6 +234,7 @@ static hm01b0_color_bar_result_t hm01b0_analyze_color_bar(
 
 esp_err_t hm01b0_diagnostics_analyze_frame(
     hm01b0_diagnostic_pattern_t pattern,
+    hm01b0_pixel_format_t pixel_format,
     const uint8_t *data,
     uint16_t width,
     uint16_t height,
@@ -270,7 +278,7 @@ esp_err_t hm01b0_diagnostics_analyze_frame(
                              : HM01B0_DIAGNOSTIC_STATUS_WARNING;
     } else {
         report->result.color_bar = hm01b0_analyze_color_bar(
-            data, stride, area);
+            data, stride, area, pixel_format);
         const hm01b0_color_bar_result_t *result =
             &report->result.color_bar;
         report->status = result->strong_transitions > 0U &&

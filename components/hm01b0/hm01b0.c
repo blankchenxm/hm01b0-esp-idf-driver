@@ -9,6 +9,7 @@
 #include "esp_rom_sys.h"
 #include "hm01b0.h"
 #include "hm01b0_private.h"
+#include "hm01b0_regs.h"
 #include "hm01b0_tables.h"
 
 #define HM01B0_POR_DELAY_US  50U
@@ -89,6 +90,8 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
                         GPIO_IS_VALID_GPIO(config->i2c_scl_gpio) &&
                         config->mclk_freq_hz > 0 &&
                         config->i2c_freq_hz > 0 &&
+                        config->variant >= HM01B0_VARIANT_MWA_MONO &&
+                        config->variant <= HM01B0_VARIANT_ANA_BAYER &&
                         config->initial_mode >= HM01B0_SENSOR_MODE_FULL &&
                         config->initial_mode <= HM01B0_SENSOR_MODE_QQVGA &&
                         config->data_interface >= HM01B0_DATA_INTERFACE_8_BIT &&
@@ -97,6 +100,11 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
                         config->test_pattern >= HM01B0_TEST_PATTERN_OFF &&
                         config->test_pattern <= HM01B0_TEST_PATTERN_WALKING_1,
                         ESP_ERR_INVALID_ARG, TAG, "invalid HM01B0 configuration");
+    ESP_RETURN_ON_FALSE(
+        config->variant != HM01B0_VARIANT_ANA_BAYER ||
+            config->initial_mode != HM01B0_SENSOR_MODE_QQVGA,
+        ESP_ERR_NOT_SUPPORTED, TAG,
+        "ANA Bayer variant does not support QQVGA binning");
 
     *out_handle = NULL;
     hm01b0_handle_t *dev = calloc(1, sizeof(*dev));
@@ -107,6 +115,10 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
     dev->mclk_timer = LEDC_TIMER_0;
     dev->mclk_channel = LEDC_CHANNEL_0;
     dev->state = HM01B0_STATE_UNINITIALIZED;
+    dev->variant = config->variant;
+    dev->pixel_format = config->variant == HM01B0_VARIANT_MWA_MONO
+                            ? HM01B0_PIXEL_FORMAT_MONO8
+                            : HM01B0_PIXEL_FORMAT_BAYER_BGGR8;
     dev->frame_rate = HM01B0_FRAME_RATE_UNCONFIGURED;
 
     esp_err_t ret = hm01b0_start_mclk(dev, config->mclk_gpio,
@@ -180,6 +192,40 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
         goto initialization_failed;
     }
 
+    const hm01b0_regval_t *variant_table =
+        config->variant == HM01B0_VARIANT_ANA_BAYER
+            ? hm01b0_variant_bayer
+            : hm01b0_variant_mono;
+    const size_t variant_table_count =
+        config->variant == HM01B0_VARIANT_ANA_BAYER
+            ? hm01b0_variant_bayer_count
+            : hm01b0_variant_mono_count;
+    ret = hm01b0_write_table(dev, variant_table, variant_table_count);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to apply %s variant table: %s",
+                 hm01b0_variant_name(config->variant), esp_err_to_name(ret));
+        goto initialization_failed;
+    }
+    uint8_t dpc_ctrl = 0U;
+    ret = hm01b0_reg_read(dev, HM01B0_REG_DPC_CTRL, &dpc_ctrl);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to read back DPC_CTRL: %s",
+                 esp_err_to_name(ret));
+        goto initialization_failed;
+    }
+    const uint8_t expected_dpc =
+        config->variant == HM01B0_VARIANT_ANA_BAYER
+            ? HM01B0_DPC_BAYER_OPTION_1
+            : HM01B0_DPC_MONO_OPTION_1;
+    if (dpc_ctrl != expected_dpc) {
+        ret = ESP_ERR_INVALID_RESPONSE;
+        ESP_LOGE(TAG, "DPC_CTRL readback mismatch: expected=0x%02X actual=0x%02X",
+                 expected_dpc, dpc_ctrl);
+        goto initialization_failed;
+    }
+    ESP_LOGI(TAG, "variant=%s DPC_CTRL=0x%02X",
+             hm01b0_variant_name(config->variant), dpc_ctrl);
+
     ret = hm01b0_set_mode(dev, config->initial_mode);
     if (ret != ESP_OK) {
         goto initialization_failed;
@@ -200,8 +246,11 @@ esp_err_t hm01b0_new(const hm01b0_config_t *config,
         goto initialization_failed;
     }
 
-    ESP_LOGI(TAG, "initialization complete: MODEL_ID=0x%04X, state=STANDBY",
-             model_id);
+    ESP_LOGI(TAG,
+             "initialization complete: MODEL_ID=0x%04X, variant=%s, "
+             "pixel_format=%s, state=STANDBY",
+             model_id, hm01b0_variant_name(dev->variant),
+             hm01b0_pixel_format_name(dev->pixel_format));
 
     *out_handle = dev;
     return ESP_OK;

@@ -48,7 +48,6 @@ const hm01b0_regval_t hm01b0_common_init[] = {
     HM01B0_REG_WRITE(HM01B0_REG_DIGITAL_GAIN_CONTROL, 0x7FU),
     HM01B0_REG_WRITE(HM01B0_REG_BLI_ENABLE, 0x01U),
 
-    HM01B0_REG_WRITE(HM01B0_REG_DPC_CTRL, 0x01U),
     HM01B0_REG_WRITE(HM01B0_REG_SINGLE_THR_HOT, 0x90U),
     HM01B0_REG_WRITE(HM01B0_REG_SINGLE_THR_COLD, 0x40U),
     HM01B0_REG_WRITE(HM01B0_REG_SYNC_PIXEL_SHIFT_ENABLE, 0x00U),
@@ -102,6 +101,21 @@ const hm01b0_regval_t hm01b0_common_init[] = {
 
 const size_t hm01b0_common_init_count =
     HM01B0_TABLE_COUNT(hm01b0_common_init);
+
+const hm01b0_regval_t hm01b0_variant_mono[] = {
+    HM01B0_REG_WRITE(HM01B0_REG_DPC_CTRL, HM01B0_DPC_MONO_OPTION_1),
+};
+
+const size_t hm01b0_variant_mono_count =
+    HM01B0_TABLE_COUNT(hm01b0_variant_mono);
+
+/* ANA color silicon requires a Bayer-aware defect-pixel algorithm. */
+const hm01b0_regval_t hm01b0_variant_bayer[] = {
+    HM01B0_REG_WRITE(HM01B0_REG_DPC_CTRL, HM01B0_DPC_BAYER_OPTION_1),
+};
+
+const size_t hm01b0_variant_bayer_count =
+    HM01B0_TABLE_COUNT(hm01b0_variant_bayer);
 
 /*
  * Safe initial timing for a 6 MHz Sensor_Core: approximately 30 FPS.
