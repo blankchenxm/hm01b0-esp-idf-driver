@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "hm01b0.h"
 #include "hm01b0_capture.h"
 
 #define HM01B0_CAPTURE_TASK_STACK_SIZE      4096U
