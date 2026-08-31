@@ -32,7 +32,7 @@ Camera Buffer A/B (one byte per pixel, unchanged Stage 6 policy)
         |
         | Capture Task: non-blocking crop + one-pixel halo copy
         v
-PSRAM RAW8 staging (242 x 242 = 58,564 bytes for 240 x 240 output)
+Internal-SRAM RAW8 staging (242 x 242 = 58,564 bytes for 240 x 240 output)
         |
         | single-slot queue -> dedicated Image/Display Task
         v
@@ -48,25 +48,33 @@ esp_lcd SPI DMA -> ST7789
 There is no complete RGB888 frame. Each Bayer output pixel is reconstructed as
 R/G/B and immediately packed to two-byte RGB565.
 
-Memory policy remains:
+Stage 7 memory policy is:
 
-| Mode | Camera A/B | RGB565 workspace |
-|---|---|---|
-| Full | PSRAM | Internal DMA SRAM |
-| QVGA | Internal DMA SRAM | Internal DMA SRAM |
-| QQVGA (MWA only) | Internal DMA SRAM | Internal DMA SRAM |
+| Variant / Mode | Camera A/B | RAW8 staging | RGB565 workspace |
+|---|---|---|---|
+| ANA Full | PSRAM | Internal SRAM | Internal DMA SRAM |
+| ANA QVGA | PSRAM | Internal SRAM | Internal DMA SRAM |
+| MWA Full | PSRAM | Not used | Internal DMA SRAM |
+| MWA QVGA/QQVGA | Internal DMA SRAM | Not used | Internal DMA SRAM |
 
-ANA additionally allocates one PSRAM RAW8 staging image. It is not a third
-Camera Buffer and GDMA never writes into it. Capture Task copies only the LCD
-source crop plus its Bayer halo and returns Camera A/B before Demosaic begins.
+ANA additionally allocates one 58,564-byte internal-SRAM RAW8 staging image. It
+is not a third Camera Buffer and GDMA never writes into it. Capture Task copies
+only the LCD source crop plus its Bayer halo and returns Camera A/B before
+Demosaic begins.
 If that one staging image is still owned by Image/Display Task, the next display
 frame is dropped rather than blocking capture or requesting a third Camera
 Buffer.
 
-The Image/Display task uses a faster interior-pixel Demosaic path with direct
-row pointers and fixed two-/four-sample averages. The one-pixel halo means all
-240 x 240 output pixels can use this path; the generic border-safe algorithm is
-retained for other callers.
+The Image/Display task uses a faster interior-row Demosaic path with direct row
+pointers, fixed two-/four-sample averages, and two-pixel loops specialized for
+the row's Bayer phase. The one-pixel halo means all 240 x 240 output pixels can
+use this path; the generic border-safe algorithm is retained for other callers.
+Internal SRAM avoids repeated cached-PSRAM neighbor reads during Demosaic.
+
+After submitting a frame, `esp_lcd_panel_draw_bitmap()` can return shortly
+before SPI DMA releases the RGB565 workspace. Image/Display Task now waits up
+to 20 ms for that completion rather than immediately discarding an already
+staged frame. `rgb_busy` therefore represents an actual wait timeout.
 
 The preflight snapshot continues borrowing 57,600 RAW8 bytes from the display
 workspace. It is converted one row at a time into the existing 480-byte line

@@ -538,7 +538,8 @@ void app_main(void)
         .frame_height = s_mode_profile.sensor.transport_height,
         .dma_burst_size = APP_CAPTURE_DMA_BURST_SIZE,
         .buffer_memory =
-            APP_HM01B0_MODE == HM01B0_SENSOR_MODE_FULL
+            APP_HM01B0_VARIANT == HM01B0_VARIANT_ANA_BAYER ||
+                    APP_HM01B0_MODE == HM01B0_SENSOR_MODE_FULL
                 ? HM01B0_CAPTURE_BUFFER_PSRAM
                 : HM01B0_CAPTURE_BUFFER_INTERNAL,
     };
@@ -643,7 +644,7 @@ void app_main(void)
              (unsigned)s_mode_profile.display_y,
              (unsigned)APP_ST7789_WIDTH,
              (unsigned)APP_ST7789_HEIGHT,
-             s_live_display != NULL ? "PSRAM staging + Image Task"
+             s_live_display != NULL ? "internal staging + Image Task"
                                     : "direct Mono conversion");
 
     while (true) {

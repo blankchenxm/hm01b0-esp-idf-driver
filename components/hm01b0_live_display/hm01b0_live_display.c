@@ -18,6 +18,7 @@
 #define HM01B0_LIVE_DISPLAY_TASK_PRIORITY   4U
 #define HM01B0_LIVE_DISPLAY_QUEUE_LENGTH    1U
 #define HM01B0_LIVE_DISPLAY_QUEUE_WAIT_MS   20U
+#define HM01B0_LIVE_DISPLAY_RGB_WAIT_MS     20U
 #define HM01B0_LIVE_DISPLAY_STOP_TIMEOUT_MS 5000U
 #define HM01B0_LIVE_DISPLAY_BAYER_HALO      1U
 
@@ -101,8 +102,12 @@ static void hm01b0_live_display_task(void *arg)
 
         uint8_t *rgb565 = NULL;
         size_t rgb565_size = 0U;
-        esp_err_t ret = st7789_display_try_acquire_rgb565_frame(
-            handle->config.display, &rgb565, &rgb565_size);
+        esp_err_t ret = st7789_display_wait_idle(
+            handle->config.display, HM01B0_LIVE_DISPLAY_RGB_WAIT_MS);
+        if (ret == ESP_OK) {
+            ret = st7789_display_try_acquire_rgb565_frame(
+                handle->config.display, &rgb565, &rgb565_size);
+        }
         if (ret == ESP_ERR_TIMEOUT) {
             portENTER_CRITICAL(&handle->stats_lock);
             handle->stats.rgb_busy_drops++;
@@ -224,14 +229,16 @@ esp_err_t hm01b0_live_display_new(
     handle->staging_size =
         (size_t)handle->staging_width * handle->staging_height;
 
-    const uint32_t caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
+    /* CPU-only image: internal SRAM avoids cached PSRAM neighbor reads. */
+    const uint32_t caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT;
     const size_t free_before = heap_caps_get_free_size(caps);
     const size_t largest_before = heap_caps_get_largest_free_block(caps);
     handle->staging_buffer = heap_caps_malloc(handle->staging_size, caps);
     ESP_GOTO_ON_FALSE(handle->staging_buffer != NULL, ESP_ERR_NO_MEM, fail,
-                      TAG, "failed to allocate PSRAM RAW8 staging buffer");
+                      TAG, "failed to allocate internal RAW8 staging buffer");
     ESP_LOGI(TAG,
-             "RAW8 staging=%p PSRAM, source=(%u,%u %ux%u), output=(%u,%u "
+             "RAW8 staging=%p internal SRAM, source=(%u,%u %ux%u), "
+             "output=(%u,%u "
              "%ux%u), bytes=%u; heap before free=%u largest=%u, after "
              "free=%u largest=%u",
              handle->staging_buffer,

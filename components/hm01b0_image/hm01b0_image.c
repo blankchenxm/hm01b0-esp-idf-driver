@@ -60,52 +60,6 @@ static inline uint8_t hm01b0_average_4(uint8_t first,
     return (uint8_t)(((uint16_t)first + second + third + fourth + 2U) >> 2U);
 }
 
-/* Fast path for pixels with a complete one-pixel Bayer neighborhood. */
-static inline void hm01b0_demosaic_interior_pixel(
-    const hm01b0_raw8_image_t *source,
-    uint16_t x,
-    uint16_t y,
-    uint8_t *red,
-    uint8_t *green,
-    uint8_t *blue)
-{
-    const uint8_t *previous = source->data + (size_t)(y - 1U) * source->stride;
-    const uint8_t *current = source->data + (size_t)y * source->stride;
-    const uint8_t *next = source->data + (size_t)(y + 1U) * source->stride;
-    const uint16_t absolute_x = (uint16_t)(source->origin_x + x);
-    const uint16_t absolute_y = (uint16_t)(source->origin_y + y);
-    const hm01b0_cfa_color_t color = hm01b0_cfa_color(
-        source->pixel_format, absolute_x, absolute_y);
-
-    if (color == HM01B0_CFA_RED) {
-        *red = current[x];
-        *green = hm01b0_average_4(current[x - 1U], current[x + 1U],
-                                  previous[x], next[x]);
-        *blue = hm01b0_average_4(previous[x - 1U], previous[x + 1U],
-                                 next[x - 1U], next[x + 1U]);
-        return;
-    }
-    if (color == HM01B0_CFA_BLUE) {
-        *blue = current[x];
-        *green = hm01b0_average_4(current[x - 1U], current[x + 1U],
-                                  previous[x], next[x]);
-        *red = hm01b0_average_4(previous[x - 1U], previous[x + 1U],
-                                next[x - 1U], next[x + 1U]);
-        return;
-    }
-
-    *green = current[x];
-    const hm01b0_cfa_color_t horizontal_color = hm01b0_cfa_color(
-        source->pixel_format, (uint16_t)(absolute_x - 1U), absolute_y);
-    if (horizontal_color == HM01B0_CFA_RED) {
-        *red = hm01b0_average_2(current[x - 1U], current[x + 1U]);
-        *blue = hm01b0_average_2(previous[x], next[x]);
-    } else {
-        *blue = hm01b0_average_2(current[x - 1U], current[x + 1U]);
-        *red = hm01b0_average_2(previous[x], next[x]);
-    }
-}
-
 static uint8_t hm01b0_average_color(
     const hm01b0_raw8_image_t *source,
     int32_t x,
@@ -173,16 +127,156 @@ static void hm01b0_demosaic_pixel(const hm01b0_raw8_image_t *source,
     }
 }
 
-static void hm01b0_store_rgb565_be(uint8_t *destination,
-                                   uint8_t red,
-                                   uint8_t green,
-                                   uint8_t blue)
+static inline void hm01b0_store_rgb565_be(uint8_t *destination,
+                                          uint8_t red,
+                                          uint8_t green,
+                                          uint8_t blue)
 {
     const uint16_t rgb565 = (uint16_t)(((uint16_t)(red >> 3U) << 11U) |
                                       ((uint16_t)(green >> 2U) << 5U) |
                                       (blue >> 3U));
     destination[0] = (uint8_t)(rgb565 >> 8U);
     destination[1] = (uint8_t)rgb565;
+}
+
+static inline void hm01b0_store_red_site(
+    const uint8_t *previous,
+    const uint8_t *current,
+    const uint8_t *next,
+    uint16_t x,
+    uint8_t *destination)
+{
+    hm01b0_store_rgb565_be(
+        destination,
+        current[x],
+        hm01b0_average_4(current[x - 1U], current[x + 1U],
+                         previous[x], next[x]),
+        hm01b0_average_4(previous[x - 1U], previous[x + 1U],
+                         next[x - 1U], next[x + 1U]));
+}
+
+static inline void hm01b0_store_blue_site(
+    const uint8_t *previous,
+    const uint8_t *current,
+    const uint8_t *next,
+    uint16_t x,
+    uint8_t *destination)
+{
+    hm01b0_store_rgb565_be(
+        destination,
+        hm01b0_average_4(previous[x - 1U], previous[x + 1U],
+                         next[x - 1U], next[x + 1U]),
+        hm01b0_average_4(current[x - 1U], current[x + 1U],
+                         previous[x], next[x]),
+        current[x]);
+}
+
+static inline void hm01b0_store_green_red_horizontal(
+    const uint8_t *previous,
+    const uint8_t *current,
+    const uint8_t *next,
+    uint16_t x,
+    uint8_t *destination)
+{
+    hm01b0_store_rgb565_be(
+        destination,
+        hm01b0_average_2(current[x - 1U], current[x + 1U]),
+        current[x],
+        hm01b0_average_2(previous[x], next[x]));
+}
+
+static inline void hm01b0_store_green_blue_horizontal(
+    const uint8_t *previous,
+    const uint8_t *current,
+    const uint8_t *next,
+    uint16_t x,
+    uint8_t *destination)
+{
+    hm01b0_store_rgb565_be(
+        destination,
+        hm01b0_average_2(previous[x], next[x]),
+        current[x],
+        hm01b0_average_2(current[x - 1U], current[x + 1U]));
+}
+
+/*
+ * Process an interior Bayer row two pixels at a time.  The CFA phase is fixed
+ * for the complete row, so the hot loop contains no per-pixel format switch,
+ * parity calculation, row-address calculation, or boundary test.
+ */
+static void hm01b0_demosaic_interior_row(
+    const hm01b0_raw8_image_t *source,
+    uint16_t source_x,
+    uint16_t source_y,
+    uint16_t width,
+    uint8_t *destination)
+{
+    const uint8_t *previous =
+        source->data + (size_t)(source_y - 1U) * source->stride;
+    const uint8_t *current =
+        source->data + (size_t)source_y * source->stride;
+    const uint8_t *next =
+        source->data + (size_t)(source_y + 1U) * source->stride;
+    const hm01b0_cfa_color_t first = hm01b0_cfa_color(
+        source->pixel_format,
+        (uint16_t)(source->origin_x + source_x),
+        (uint16_t)(source->origin_y + source_y));
+    const hm01b0_cfa_color_t second = hm01b0_cfa_color(
+        source->pixel_format,
+        (uint16_t)(source->origin_x + source_x + 1U),
+        (uint16_t)(source->origin_y + source_y));
+    uint16_t column = 0U;
+
+    if (first == HM01B0_CFA_RED) {
+        for (; column + 1U < width; column += 2U) {
+            const uint16_t x = (uint16_t)(source_x + column);
+            hm01b0_store_red_site(previous, current, next, x,
+                                  destination + (size_t)column * 2U);
+            hm01b0_store_green_red_horizontal(
+                previous, current, next, (uint16_t)(x + 1U),
+                destination + (size_t)(column + 1U) * 2U);
+        }
+    } else if (first == HM01B0_CFA_BLUE) {
+        for (; column + 1U < width; column += 2U) {
+            const uint16_t x = (uint16_t)(source_x + column);
+            hm01b0_store_blue_site(previous, current, next, x,
+                                   destination + (size_t)column * 2U);
+            hm01b0_store_green_blue_horizontal(
+                previous, current, next, (uint16_t)(x + 1U),
+                destination + (size_t)(column + 1U) * 2U);
+        }
+    } else if (second == HM01B0_CFA_RED) {
+        for (; column + 1U < width; column += 2U) {
+            const uint16_t x = (uint16_t)(source_x + column);
+            hm01b0_store_green_red_horizontal(
+                previous, current, next, x,
+                destination + (size_t)column * 2U);
+            hm01b0_store_red_site(
+                previous, current, next, (uint16_t)(x + 1U),
+                destination + (size_t)(column + 1U) * 2U);
+        }
+    } else {
+        for (; column + 1U < width; column += 2U) {
+            const uint16_t x = (uint16_t)(source_x + column);
+            hm01b0_store_green_blue_horizontal(
+                previous, current, next, x,
+                destination + (size_t)column * 2U);
+            hm01b0_store_blue_site(
+                previous, current, next, (uint16_t)(x + 1U),
+                destination + (size_t)(column + 1U) * 2U);
+        }
+    }
+
+    if (column < width) {
+        uint8_t red = 0U;
+        uint8_t green = 0U;
+        uint8_t blue = 0U;
+        const uint16_t x = (uint16_t)(source_x + column);
+        hm01b0_demosaic_pixel(source, x, source_y,
+                              &red, &green, &blue);
+        hm01b0_store_rgb565_be(destination + (size_t)column * 2U,
+                               red, green, blue);
+    }
 }
 
 static void hm01b0_init_gray_rgb565(void)
@@ -221,31 +315,30 @@ static void hm01b0_image_convert_row_unchecked(
 {
     if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
         hm01b0_init_gray_rgb565();
-    }
-
-    const bool fast_bayer_row =
-        source->pixel_format != HM01B0_PIXEL_FORMAT_MONO8 &&
-        source_y > 0U && source_y + 1U < source->height;
-    for (uint16_t column = 0U; column < width; ++column) {
-        const uint16_t x = (uint16_t)(source_x + column);
-        if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
+        for (uint16_t column = 0U; column < width; ++column) {
+            const uint16_t x = (uint16_t)(source_x + column);
             const uint16_t rgb565 = s_gray_rgb565[
                 source->data[(size_t)source_y * source->stride + x]];
             destination[(size_t)column * 2U] = (uint8_t)(rgb565 >> 8U);
             destination[(size_t)column * 2U + 1U] = (uint8_t)rgb565;
-            continue;
         }
+        return;
+    }
 
+    if (source_y > 0U && source_y + 1U < source->height &&
+        source_x > 0U && source_x + width < source->width) {
+        hm01b0_demosaic_interior_row(
+            source, source_x, source_y, width, destination);
+        return;
+    }
+
+    for (uint16_t column = 0U; column < width; ++column) {
+        const uint16_t x = (uint16_t)(source_x + column);
         uint8_t red = 0U;
         uint8_t green = 0U;
         uint8_t blue = 0U;
-        if (fast_bayer_row && x > 0U && x + 1U < source->width) {
-            hm01b0_demosaic_interior_pixel(source, x, source_y,
-                                            &red, &green, &blue);
-        } else {
-            hm01b0_demosaic_pixel(source, x, source_y,
-                                  &red, &green, &blue);
-        }
+        hm01b0_demosaic_pixel(source, x, source_y,
+                              &red, &green, &blue);
         hm01b0_store_rgb565_be(destination + (size_t)column * 2U,
                                red, green, blue);
     }

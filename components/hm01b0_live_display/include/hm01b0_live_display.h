@@ -55,8 +55,9 @@ esp_err_t hm01b0_live_display_delete(
 /**
  * Non-blocking Capture Task consumer.
  *
- * If the PSRAM staging buffer is busy, this display frame is dropped and the
- * function returns immediately so the caller can recycle its Camera Buffer.
+ * If the internal-SRAM staging buffer is busy, this display frame is dropped
+ * and the function returns immediately so the caller can recycle its Camera
+ * Buffer.
  */
 void hm01b0_live_display_consume_frame(
     const hm01b0_capture_frame_t *frame,
