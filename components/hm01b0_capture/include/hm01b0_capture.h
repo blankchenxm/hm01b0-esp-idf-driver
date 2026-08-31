@@ -18,10 +18,20 @@ extern "C" {
 
 typedef struct hm01b0_capture hm01b0_capture_handle_t;
 
+/** Memory pool used for the two application-visible Camera DMA buffers. */
+typedef enum {
+    HM01B0_CAPTURE_BUFFER_INTERNAL = 0,
+    HM01B0_CAPTURE_BUFFER_PSRAM,
+} hm01b0_capture_buffer_memory_t;
+
 /** Metadata for one application-visible Camera transaction buffer. */
 typedef struct {
     uint8_t *data;
+    /** Logical RAW8 image bytes: frame_width * frame_height. */
+    size_t payload_size;
+    /** DMA-accessible allocation size, including any trailing alignment pad. */
     size_t capacity;
+    /** Transaction length reported by esp_driver_cam. */
     size_t received_size;
     uint32_t sequence;
     int64_t timestamp_us;
@@ -36,6 +46,7 @@ typedef struct {
     uint16_t frame_width;
     uint16_t frame_height;
     uint32_t dma_burst_size;
+    hm01b0_capture_buffer_memory_t buffer_memory;
 } hm01b0_capture_config_t;
 
 typedef struct {
@@ -44,6 +55,7 @@ typedef struct {
     uint16_t frame_stride;
     size_t payload_size;
     size_t buffer_capacity;
+    size_t dma_padding_size;
     size_t last_received_size;
     uint32_t frames_received;
     uint32_t valid_frames;
@@ -88,7 +100,7 @@ typedef void (*hm01b0_capture_frame_consumer_t)(
     const hm01b0_capture_frame_t *frame,
     void *user_data);
 
-/** Create DVP, two internal DMA buffers, queues, and the frame task. */
+/** Create DVP, two DMA buffers in the configured memory, queues, and task. */
 esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
                              hm01b0_capture_handle_t **out_handle);
 

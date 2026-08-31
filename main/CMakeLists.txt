@@ -1,5 +1,7 @@
 idf_component_register(
-    SRCS "main.c"
+    SRCS
+        "main.c"
+        "app_mode_profile.c"
     INCLUDE_DIRS "."
     REQUIRES
         hm01b0

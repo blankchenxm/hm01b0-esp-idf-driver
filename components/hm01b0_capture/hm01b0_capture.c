@@ -104,6 +104,38 @@ static bool hm01b0_capture_valid_dma_burst(uint32_t burst_size)
             (burst_size & (burst_size - 1U)) == 0U);
 }
 
+static const char *hm01b0_capture_buffer_memory_name(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? "PSRAM DMA"
+               : "internal DMA";
+}
+
+static uint32_t hm01b0_capture_buffer_alloc_caps(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA
+               : MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+}
+
+static uint32_t hm01b0_capture_buffer_heap_caps(
+    hm01b0_capture_buffer_memory_t memory)
+{
+    /*
+     * ESP-IDF's allocator accepts MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA and
+     * converts the DMA flag into the external-memory alignment requirement
+     * before selecting a heap.  The heap information APIs do not perform
+     * that conversion, because the PSRAM heap itself is advertised only as
+     * MALLOC_CAP_SPIRAM.  Query the underlying heap with its advertised caps
+     * while retaining SPIRAM | DMA for the actual Camera buffer allocation.
+     */
+    return memory == HM01B0_CAPTURE_BUFFER_PSRAM
+               ? MALLOC_CAP_SPIRAM
+               : MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
+}
+
 static bool hm01b0_capture_rect_is_valid(
     const hm01b0_capture_handle_t *handle,
     hm01b0_frame_rect_t rect)
@@ -115,6 +147,20 @@ static bool hm01b0_capture_rect_is_valid(
            rect.height <= handle->config.frame_height - rect.y;
 }
 
+static bool hm01b0_capture_frame_size_is_valid(
+    const hm01b0_capture_handle_t *handle,
+    const hm01b0_capture_frame_t *frame)
+{
+    /*
+     * RAW8 pixels occupy the first payload_size bytes. esp_driver_cam may
+     * align its non-JPEG DMA transaction to a cache/DMA boundary and report
+     * the resulting capacity as received_size. Bytes after payload_size are
+     * trailing transport padding, not pixels and not part of the row stride.
+     */
+    return frame->received_size >= handle->transport.payload_size &&
+           frame->received_size <= handle->transport.buffer_capacity;
+}
+
 static esp_err_t hm01b0_capture_validate_config(
     const hm01b0_capture_config_t *config)
 {
@@ -123,6 +169,10 @@ static esp_err_t hm01b0_capture_validate_config(
     ESP_RETURN_ON_FALSE(config->frame_width > 0U &&
                         config->frame_height > 0U,
                         ESP_ERR_INVALID_ARG, TAG, "invalid frame geometry");
+    ESP_RETURN_ON_FALSE(
+        config->buffer_memory == HM01B0_CAPTURE_BUFFER_INTERNAL ||
+            config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM,
+        ESP_ERR_INVALID_ARG, TAG, "invalid Camera buffer memory selection");
     ESP_RETURN_ON_FALSE(GPIO_IS_VALID_GPIO(config->pclk_gpio) &&
                         GPIO_IS_VALID_GPIO(config->vsync_gpio) &&
                         GPIO_IS_VALID_GPIO(config->de_gpio),
@@ -165,6 +215,9 @@ static void hm01b0_capture_reset_session(hm01b0_capture_handle_t *handle)
         .payload_size = (size_t)handle->config.frame_width *
                         handle->config.frame_height,
         .buffer_capacity = capacity,
+        .dma_padding_size =
+            capacity - (size_t)handle->config.frame_width *
+                           handle->config.frame_height,
     };
     handle->diagnostic_report = (hm01b0_diagnostic_report_t) {
         .pattern = handle->diagnostic_enabled
@@ -354,6 +407,7 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
     ESP_LOGI(TAG,
              "fps=%" PRIu32 ".%03" PRIu32 " received=%" PRIu32
              " valid=%" PRIu32 " size_err=%" PRIu32
+             " size_change=%" PRIu32
              " no_buffer=%" PRIu32 " ready_overflow=%" PRIu32
              " free_err=%" PRIu32,
              handle->transport.fps_milli / 1000U,
@@ -361,6 +415,7 @@ static void hm01b0_capture_log_stats(hm01b0_capture_handle_t *handle,
              handle->transport.frames_received,
              handle->transport.valid_frames,
              handle->transport.size_errors,
+             handle->transport.received_size_changes,
              handle->transport.no_free_buffer,
              handle->transport.ready_queue_overflows,
              handle->transport.free_queue_errors);
@@ -440,7 +495,7 @@ static void hm01b0_capture_process_transport(
     bool *size_valid)
 {
     handle->transport.last_received_size = frame->received_size;
-    *size_valid = frame->received_size == handle->transport.payload_size;
+    *size_valid = hm01b0_capture_frame_size_is_valid(handle, frame);
 
     if (!handle->baseline_received_size_valid) {
         handle->baseline_received_size = frame->received_size;
@@ -455,8 +510,9 @@ static void hm01b0_capture_process_transport(
         handle->transport.size_errors++;
         if (hm01b0_capture_error_log_allowed(handle, now_us)) {
             ESP_LOGE(TAG,
-                     "frame=%" PRIu32 " size error: received=%u payload=%u "
-                     "capacity=%u",
+                     "frame=%" PRIu32
+                     " transaction size error: received=%u "
+                     "logical_payload=%u dma_capacity=%u",
                      frame->sequence, (unsigned)frame->received_size,
                      (unsigned)handle->transport.payload_size,
                      (unsigned)handle->transport.buffer_capacity);
@@ -651,20 +707,23 @@ static void hm01b0_capture_task(void *arg)
 static void hm01b0_capture_log_memory(const hm01b0_capture_handle_t *handle)
 {
     ESP_LOGI(TAG,
-             "internal DMA heap before: free=%u largest=%u; after: free=%u "
-             "largest=%u",
+             "%s heap before: free=%u largest=%u; after: free=%u largest=%u",
+             hm01b0_capture_buffer_memory_name(
+                 handle->config.buffer_memory),
              (unsigned)handle->dma_heap_free_before,
              (unsigned)handle->dma_heap_largest_before,
              (unsigned)handle->dma_heap_free_after,
              (unsigned)handle->dma_heap_largest_after);
     ESP_LOGI(TAG,
-             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, payload=%u bytes",
+             "buffers: A=%p (%s), B=%p (%s), each=%u bytes, "
+             "logical_payload=%u bytes, dma_padding=%u bytes",
              handle->frames[0].data,
              esp_ptr_internal(handle->frames[0].data) ? "internal" : "external",
              handle->frames[1].data,
              esp_ptr_internal(handle->frames[1].data) ? "internal" : "external",
              (unsigned)handle->transport.buffer_capacity,
-             (unsigned)handle->transport.payload_size);
+             (unsigned)handle->transport.payload_size,
+             (unsigned)handle->transport.dma_padding_size);
 }
 
 esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
@@ -681,6 +740,22 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     ESP_RETURN_ON_FALSE(handle != NULL, ESP_ERR_NO_MEM, TAG,
                         "failed to allocate capture context");
     handle->config = *config;
+
+    const uint32_t buffer_alloc_caps = hm01b0_capture_buffer_alloc_caps(
+        config->buffer_memory);
+    const uint32_t buffer_heap_caps = hm01b0_capture_buffer_heap_caps(
+        config->buffer_memory);
+    const char *buffer_memory_name = hm01b0_capture_buffer_memory_name(
+        config->buffer_memory);
+    esp_err_t ret = ESP_OK;
+    if (config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM &&
+        heap_caps_get_total_size(buffer_heap_caps) == 0U) {
+        ESP_LOGE(TAG,
+                 "PSRAM heap is unavailable; enable PSRAM and expose it "
+                 "through the capability allocator");
+        ret = ESP_ERR_NOT_SUPPORTED;
+        goto fail;
+    }
 
     const esp_cam_ctlr_dvp_pin_config_t pin_config = {
         .data_width = CAM_CTLR_DATA_WIDTH_8,
@@ -713,7 +788,7 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         .pin = &pin_config,
     };
 
-    esp_err_t ret = esp_cam_new_dvp_ctlr(&dvp_config, &handle->cam_handle);
+    ret = esp_cam_new_dvp_ctlr(&dvp_config, &handle->cam_handle);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to create DVP controller: %s",
                  esp_err_to_name(ret));
@@ -737,27 +812,65 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
         ret = ESP_ERR_INVALID_SIZE;
         goto fail;
     }
+    handle->transport.dma_padding_size =
+        handle->transport.buffer_capacity - handle->transport.payload_size;
 
-    const uint32_t dma_caps = MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA;
-    handle->dma_heap_free_before = heap_caps_get_free_size(dma_caps);
+    handle->dma_heap_free_before = heap_caps_get_free_size(buffer_heap_caps);
     handle->dma_heap_largest_before =
-        heap_caps_get_largest_free_block(dma_caps);
+        heap_caps_get_largest_free_block(buffer_heap_caps);
+    ESP_LOGI(TAG,
+             "allocating %u Camera Buffers, each=%u bytes in %s; "
+             "heap free=%u largest=%u",
+             (unsigned)HM01B0_CAPTURE_BUFFER_COUNT,
+             (unsigned)handle->transport.buffer_capacity,
+             buffer_memory_name,
+             (unsigned)handle->dma_heap_free_before,
+             (unsigned)handle->dma_heap_largest_before);
 
     for (size_t i = 0; i < HM01B0_CAPTURE_BUFFER_COUNT; ++i) {
+        const size_t free_before_buffer =
+            heap_caps_get_free_size(buffer_heap_caps);
+        const size_t largest_before_buffer =
+            heap_caps_get_largest_free_block(buffer_heap_caps);
         handle->frames[i].data = esp_cam_ctlr_alloc_buffer(
-            handle->cam_handle, handle->transport.buffer_capacity, dma_caps);
+            handle->cam_handle, handle->transport.buffer_capacity,
+            buffer_alloc_caps);
         if (handle->frames[i].data == NULL) {
-            ESP_LOGE(TAG, "failed to allocate internal DMA Buffer %c",
-                     (int)('A' + i));
+            ESP_LOGE(TAG,
+                     "failed to allocate %s Buffer %c: "
+                     "required=%u free=%u largest=%u",
+                     buffer_memory_name,
+                     (int)('A' + i),
+                     (unsigned)handle->transport.buffer_capacity,
+                     (unsigned)free_before_buffer,
+                     (unsigned)largest_before_buffer);
             ret = ESP_ERR_NO_MEM;
             goto fail;
         }
+        const bool location_valid =
+            config->buffer_memory == HM01B0_CAPTURE_BUFFER_PSRAM
+                ? esp_ptr_external_ram(handle->frames[i].data)
+                : esp_ptr_internal(handle->frames[i].data);
+        if (!location_valid) {
+            ESP_LOGE(TAG, "Buffer %c was not allocated in %s",
+                     (int)('A' + i), buffer_memory_name);
+            ret = ESP_ERR_INVALID_STATE;
+            goto fail;
+        }
+        handle->frames[i].payload_size = handle->transport.payload_size;
         handle->frames[i].capacity = handle->transport.buffer_capacity;
+        ESP_LOGI(TAG,
+                 "Buffer %c allocated at %p: required=%u; heap now free=%u "
+                 "largest=%u",
+                 (int)('A' + i), handle->frames[i].data,
+                 (unsigned)handle->transport.buffer_capacity,
+                 (unsigned)heap_caps_get_free_size(buffer_heap_caps),
+                 (unsigned)heap_caps_get_largest_free_block(buffer_heap_caps));
     }
 
-    handle->dma_heap_free_after = heap_caps_get_free_size(dma_caps);
+    handle->dma_heap_free_after = heap_caps_get_free_size(buffer_heap_caps);
     handle->dma_heap_largest_after =
-        heap_caps_get_largest_free_block(dma_caps);
+        heap_caps_get_largest_free_block(buffer_heap_caps);
 
     handle->free_queue = xQueueCreateStatic(
         HM01B0_CAPTURE_BUFFER_COUNT, sizeof(hm01b0_capture_frame_t *),
@@ -795,12 +908,14 @@ esp_err_t hm01b0_capture_new(const hm01b0_capture_config_t *config,
     }
 
     ESP_LOGI(TAG,
-             "DVP ready: RAW8 %ux%u, payload=%u, capacity=%u, burst=%" PRIu32
-             ", buffers=2, backup=disabled",
+             "DVP ready: RAW8 %ux%u, logical_payload=%u, dma_capacity=%u, "
+             "dma_padding=%u, burst=%" PRIu32
+             ", buffers=2, camera_memory=%s, backup=disabled",
              config->frame_width, config->frame_height,
              (unsigned)handle->transport.payload_size,
              (unsigned)handle->transport.buffer_capacity,
-             config->dma_burst_size);
+             (unsigned)handle->transport.dma_padding_size,
+             config->dma_burst_size, buffer_memory_name);
     hm01b0_capture_log_memory(handle);
     *out_handle = handle;
     return ESP_OK;

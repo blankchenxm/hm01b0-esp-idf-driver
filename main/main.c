@@ -2,6 +2,7 @@
 #include <stdatomic.h>
 
 #include "app_config.h"
+#include "app_mode_profile.h"
 #include "board_config.h"
 #include "driver/i2c_types.h"
 #include "driver/spi_master.h"
@@ -14,7 +15,7 @@
 #include "hm01b0_capture.h"
 #include "st7789_display.h"
 
-static const char *TAG = "hm01b0_stage5";
+static const char *TAG = "hm01b0_stage6";
 
 static hm01b0_handle_t *s_sensor;
 static hm01b0_capture_handle_t *s_capture;
@@ -24,9 +25,7 @@ static TaskHandle_t s_app_task;
 static hm01b0_snapshot_result_t s_snapshot_result;
 static atomic_bool s_live_warmup_complete;
 static int64_t s_last_display_error_log_us;
-static uint16_t s_live_source_width;
-static uint16_t s_live_source_height;
-static size_t s_live_source_stride;
+static app_mode_profile_t s_mode_profile;
 
 static void hm01b0_snapshot_ready(
     const hm01b0_snapshot_result_t *result,
@@ -65,11 +64,15 @@ static void hm01b0_live_frame_ready(
     const esp_err_t ret = st7789_display_try_draw_gray8_frame(
         display,
         frame->data,
-        s_live_source_width,
-        s_live_source_height,
-        s_live_source_stride,
-        APP_DISPLAY_CROP_X,
-        APP_DISPLAY_CROP_Y);
+        s_mode_profile.sensor.transport_width,
+        s_mode_profile.sensor.transport_height,
+        s_mode_profile.sensor.transport_width,
+        s_mode_profile.display_source.x,
+        s_mode_profile.display_source.y,
+        s_mode_profile.display_source.width,
+        s_mode_profile.display_source.height,
+        s_mode_profile.display_x,
+        s_mode_profile.display_y);
     if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
         return;
     }
@@ -185,12 +188,13 @@ static esp_err_t hm01b0_run_preflight(
 
     const hm01b0_snapshot_request_t snapshot_request = {
         .buffer = s_snapshot,
-        .buffer_size = APP_DISPLAY_CROP_WIDTH * APP_DISPLAY_CROP_HEIGHT,
+        .buffer_size = (size_t)s_mode_profile.display_source.width *
+                       s_mode_profile.display_source.height,
         .crop = {
-            .x = APP_DISPLAY_CROP_X,
-            .y = APP_DISPLAY_CROP_Y,
-            .width = APP_DISPLAY_CROP_WIDTH,
-            .height = APP_DISPLAY_CROP_HEIGHT,
+            .x = s_mode_profile.display_source.x,
+            .y = s_mode_profile.display_source.y,
+            .width = s_mode_profile.display_source.width,
+            .height = s_mode_profile.display_source.height,
         },
         .skip_frames = APP_PREFLIGHT_WARMUP_FRAMES,
         .on_ready = hm01b0_snapshot_ready,
@@ -231,9 +235,9 @@ static esp_err_t hm01b0_run_preflight(
 
     const int64_t display_start_us = esp_timer_get_time();
     ret = st7789_display_draw_gray8(
-        s_display, 0U, 0U,
-        APP_DISPLAY_CROP_WIDTH,
-        APP_DISPLAY_CROP_HEIGHT,
+        s_display, s_mode_profile.display_x, s_mode_profile.display_y,
+        s_mode_profile.display_source.width,
+        s_mode_profile.display_source.height,
         s_snapshot);
     if (ret != ESP_OK) {
         (void)hm01b0_stream_stop(s_sensor);
@@ -312,8 +316,8 @@ static void hm01b0_cleanup(void)
 void app_main(void)
 {
     s_app_task = xTaskGetCurrentTaskHandle();
-    ESP_LOGI(TAG, "Stage 5 startup: initialize, preflight both patterns, "
-                  "then stream real QVGA images to ST7789");
+    ESP_LOGI(TAG, "Stage 6 startup: initialize, preflight both patterns, "
+                  "then stream the selected HM01B0 mode to ST7789");
     ESP_LOGI(TAG, "Control pins: MCLK=%d SDA=%d SCL=%d",
              BOARD_HM01B0_MCLK_GPIO,
              BOARD_HM01B0_I2C_SDA_GPIO,
@@ -327,25 +331,30 @@ void app_main(void)
              BOARD_HM01B0_D4_GPIO, BOARD_HM01B0_D5_GPIO,
              BOARD_HM01B0_D6_GPIO, BOARD_HM01B0_D7_GPIO);
 
-    hm01b0_mode_info_t mode_info = {0};
-    esp_err_t ret = hm01b0_get_mode_info(APP_HM01B0_MODE, &mode_info);
+    esp_err_t ret = app_mode_profile_build(
+        APP_HM01B0_MODE, APP_ST7789_WIDTH, APP_ST7789_HEIGHT,
+        &s_mode_profile);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "failed to obtain sensor mode geometry: %s",
+        ESP_LOGE(TAG, "failed to build sensor/display mode profile: %s",
                  esp_err_to_name(ret));
         return;
     }
-    if (APP_DISPLAY_CROP_WIDTH != APP_ST7789_WIDTH ||
-        APP_DISPLAY_CROP_HEIGHT != APP_ST7789_HEIGHT ||
-        APP_DISPLAY_CROP_X >= mode_info.transport_width ||
-        APP_DISPLAY_CROP_Y >= mode_info.transport_height ||
-        APP_DISPLAY_CROP_WIDTH >
-            mode_info.transport_width - APP_DISPLAY_CROP_X ||
-        APP_DISPLAY_CROP_HEIGHT >
-            mode_info.transport_height - APP_DISPLAY_CROP_Y) {
-        ESP_LOGE(TAG, "display crop is incompatible with sensor/display "
-                      "geometry");
-        return;
-    }
+    ESP_LOGI(TAG,
+             "mode=%s transport=%ux%u standard=(%u,%u %ux%u) "
+             "display_source=(%u,%u %ux%u) destination=(%u,%u)",
+             s_mode_profile.name,
+             (unsigned)s_mode_profile.sensor.transport_width,
+             (unsigned)s_mode_profile.sensor.transport_height,
+             (unsigned)s_mode_profile.sensor.standard.x,
+             (unsigned)s_mode_profile.sensor.standard.y,
+             (unsigned)s_mode_profile.sensor.standard.width,
+             (unsigned)s_mode_profile.sensor.standard.height,
+             (unsigned)s_mode_profile.display_source.x,
+             (unsigned)s_mode_profile.display_source.y,
+             (unsigned)s_mode_profile.display_source.width,
+             (unsigned)s_mode_profile.display_source.height,
+             (unsigned)s_mode_profile.display_x,
+             (unsigned)s_mode_profile.display_y);
 
     const hm01b0_config_t sensor_config = {
         .mclk_gpio = BOARD_HM01B0_MCLK_GPIO,
@@ -392,11 +401,17 @@ void app_main(void)
     if (ret != ESP_OK) {
         goto fail;
     }
+    ret = st7789_display_clear_gray8(s_display, 0U);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "failed to clear ST7789: %s", esp_err_to_name(ret));
+        goto fail;
+    }
     size_t snapshot_size = 0U;
     ret = st7789_display_get_preflight_buffer(
         s_display, &s_snapshot, &snapshot_size);
     if (ret != ESP_OK ||
-        snapshot_size < APP_DISPLAY_CROP_WIDTH * APP_DISPLAY_CROP_HEIGHT) {
+        snapshot_size < (size_t)s_mode_profile.display_source.width *
+                            s_mode_profile.display_source.height) {
         if (ret == ESP_OK) {
             ret = ESP_ERR_INVALID_SIZE;
         }
@@ -415,9 +430,13 @@ void app_main(void)
         .pclk_gpio = BOARD_HM01B0_PCLK_GPIO,
         .vsync_gpio = BOARD_HM01B0_VSYNC_GPIO,
         .de_gpio = BOARD_HM01B0_DE_GPIO,
-        .frame_width = mode_info.transport_width,
-        .frame_height = mode_info.transport_height,
+        .frame_width = s_mode_profile.sensor.transport_width,
+        .frame_height = s_mode_profile.sensor.transport_height,
         .dma_burst_size = APP_CAPTURE_DMA_BURST_SIZE,
+        .buffer_memory =
+            APP_HM01B0_MODE == HM01B0_SENSOR_MODE_FULL
+                ? HM01B0_CAPTURE_BUFFER_PSRAM
+                : HM01B0_CAPTURE_BUFFER_INTERNAL,
     };
     ret = hm01b0_capture_new(&capture_config, &s_capture);
     if (ret != ESP_OK) {
@@ -425,7 +444,7 @@ void app_main(void)
     }
 
     const hm01b0_frame_rect_t analysis_area =
-        hm01b0_to_frame_rect(mode_info.sensor_valid);
+        hm01b0_to_frame_rect(s_mode_profile.sensor.sensor_valid);
     ret = hm01b0_run_preflight(
         HM01B0_TEST_PATTERN_WALKING_1,
         HM01B0_DIAGNOSTIC_PATTERN_WALKING_1,
@@ -461,9 +480,6 @@ void app_main(void)
                  esp_err_to_name(ret));
         goto fail;
     }
-    s_live_source_width = mode_info.transport_width;
-    s_live_source_height = mode_info.transport_height;
-    s_live_source_stride = mode_info.transport_width;
     ret = hm01b0_capture_set_frame_consumer(
         s_capture, hm01b0_live_frame_ready, s_display);
     if (ret != ESP_OK) {
@@ -489,13 +505,18 @@ void app_main(void)
         goto fail;
     }
     ESP_LOGI(TAG,
-             "Stage 5 running: test pattern OFF, HM01B0 QVGA RAW8 324x244 "
-             "streaming; display crop=(%u,%u %ux%u), ST7789=%ux%u "
-             "RGB565 over esp_lcd SPI DMA",
-             (unsigned)APP_DISPLAY_CROP_X,
-             (unsigned)APP_DISPLAY_CROP_Y,
-             (unsigned)APP_DISPLAY_CROP_WIDTH,
-             (unsigned)APP_DISPLAY_CROP_HEIGHT,
+             "Stage 6 running: test pattern OFF, HM01B0 %s RAW8 %ux%u "
+             "streaming; source=(%u,%u %ux%u), destination=(%u,%u), "
+             "ST7789=%ux%u RGB565 over esp_lcd SPI DMA",
+             s_mode_profile.name,
+             (unsigned)s_mode_profile.sensor.transport_width,
+             (unsigned)s_mode_profile.sensor.transport_height,
+             (unsigned)s_mode_profile.display_source.x,
+             (unsigned)s_mode_profile.display_source.y,
+             (unsigned)s_mode_profile.display_source.width,
+             (unsigned)s_mode_profile.display_source.height,
+             (unsigned)s_mode_profile.display_x,
+             (unsigned)s_mode_profile.display_y,
              (unsigned)APP_ST7789_WIDTH,
              (unsigned)APP_ST7789_HEIGHT);
 
@@ -508,5 +529,5 @@ void app_main(void)
 
 fail:
     hm01b0_cleanup();
-    ESP_LOGE(TAG, "Stage 5 stopped: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Stage 6 stopped: %s", esp_err_to_name(ret));
 }
