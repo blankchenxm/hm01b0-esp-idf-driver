@@ -30,8 +30,13 @@ HM01B0 ANA Bayer RAW8
         v
 Camera Buffer A/B (one byte per pixel, unchanged Stage 6 policy)
         |
+        | Capture Task: non-blocking crop + one-pixel halo copy
         v
-hm01b0_image bilinear Demosaic + RGB565 packing
+PSRAM RAW8 staging (242 x 242 = 58,564 bytes for 240 x 240 output)
+        |
+        | single-slot queue -> dedicated Image/Display Task
+        v
+optimized bilinear Demosaic + RGB565 packing
         |
         v
 115,200-byte internal-DMA RGB565 Buffer
@@ -51,6 +56,18 @@ Memory policy remains:
 | QVGA | Internal DMA SRAM | Internal DMA SRAM |
 | QQVGA (MWA only) | Internal DMA SRAM | Internal DMA SRAM |
 
+ANA additionally allocates one PSRAM RAW8 staging image. It is not a third
+Camera Buffer and GDMA never writes into it. Capture Task copies only the LCD
+source crop plus its Bayer halo and returns Camera A/B before Demosaic begins.
+If that one staging image is still owned by Image/Display Task, the next display
+frame is dropped rather than blocking capture or requesting a third Camera
+Buffer.
+
+The Image/Display task uses a faster interior-pixel Demosaic path with direct
+row pointers and fixed two-/four-sample averages. The one-pixel halo means all
+240 x 240 output pixels can use this path; the generic border-safe algorithm is
+retained for other callers.
+
 The preflight snapshot continues borrowing 57,600 RAW8 bytes from the display
 workspace. It is converted one row at a time into the existing 480-byte line
 buffer, so Bayer preflight does not require another full frame.
@@ -63,6 +80,11 @@ buffer, so Bayer preflight does not require another full frame.
   pixels from different CFA color planes.
 - CRC remains a transport/content-change observation, not an exact datasheet
   color-value oracle.
+- Runtime statistics distinguish Camera/display rates: `pipeline_fps input`
+  counts frames offered by Capture Task, `staged` counts successful PSRAM
+  copies, `submitted` counts frames submitted to the LCD, while `display_fps`
+  counts completed SPI-DMA frames. Copy/Demosaic times and staging/RGB-busy
+  drops are reported separately.
 
 ## Owner hardware checklist
 
@@ -70,6 +92,7 @@ buffer, so Bayer preflight does not require another full frame.
 - [ ] Confirm startup log reports the expected `PIXEL_ORDER` and Bayer format.
 - [ ] Confirm `DPC_CTRL=0x03` readback.
 - [ ] Run Full at a conservative frame rate and check both test patterns.
+- [x] Confirm Walking-1 and Color-Bar preflight images display correctly.
 - [ ] Confirm the live image has plausible color ordering (no red/blue swap).
 - [ ] Record Bayer conversion time, Camera Buffer hold time, display FPS, and
       all drop/queue counters.
@@ -77,6 +100,5 @@ buffer, so Bayer preflight does not require another full frame.
 - [ ] Select ANA + QQVGA and confirm clean `ESP_ERR_NOT_SUPPORTED` rejection.
 - [ ] Switch to MWA and repeat the previously validated modes for regression.
 
-Advanced AWB, gamma, color-correction matrix tuning, higher-quality Demosaic,
-and ANA throughput optimization remain follow-up work after first hardware
-validation.
+Advanced AWB, gamma, color-correction matrix tuning, and higher-quality
+Demosaic remain follow-up work after live-pipeline hardware validation.

@@ -13,7 +13,9 @@ preflight. Stage 5 adds real-image streaming through the ESP-IDF `esp_lcd`
 ST7789 driver and one complete internal-DMA RGB565 display Buffer. Stage 6
 extends that same pipeline to Full, QVGA, and monochrome QQVGA modes. Stage 7
 adds an explicit ANA variant, Bayer phase handling, and direct RAW8 Demosaic to
-RGB565 without allocating an RGB888 frame.
+RGB565 without allocating an RGB888 frame. ANA live display is decoupled from
+Camera Buffer ownership through a small PSRAM RAW8 staging image and a dedicated
+Image/Display task.
 
 ## Current status
 
@@ -26,7 +28,7 @@ RGB565 without allocating an RGB888 frame.
 | 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
 | 5. Real-image display | Complete at QVGA 60 FPS | Hardware-validated 80 MHz `esp_lcd` ST7789, RGB565 lookup conversion, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
 | 6. Multi-mode display | Complete | Hardware-validated Full/QVGA/QQVGA flow, automatic crop/destination geometry, native QQVGA centered with black borders |
-| 7. ANA Bayer support | Implementation in progress | Explicit MWA/ANA variant, PIXEL_ORDER, Bayer DPC, Demosaic-to-RGB565, format-aware preflight/live display |
+| 7. ANA Bayer support | Hardware preflight passed; live-pipeline update awaiting validation | Explicit MWA/ANA variant, PIXEL_ORDER, Bayer DPC, optimized Demosaic-to-RGB565, PSRAM staging, independent Image/Display task, format-aware diagnostics |
 
 The current sample initializes the sensor, capture controller, two Camera DMA
 buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
@@ -91,6 +93,16 @@ preflight it temporarily stores a 57,600-byte Full/QVGA RAW8 Snapshot or a
 19,200-byte QQVGA Snapshot. Camera A/B always follow the uncropped DVP
 transport. See [stage6_todo.md](stage6_todo.md) for memory calculations,
 frame-rate limits, configuration examples, and the hardware checklist.
+
+For ANA live display, Capture Task does not run the full Bayer conversion while
+holding Camera A/B. It copies the displayed rectangle plus a one-pixel Demosaic
+halo into one PSRAM staging image, then immediately returns the Camera Buffer.
+For a 240 x 240 display crop this allocation is `242 x 242 = 58,564` bytes. A
+separate Image/Display task converts that staging image into the existing
+115,200-byte internal-DMA RGB565 workspace and submits it to `esp_lcd`. The
+single-slot staging policy is deliberately non-blocking: if image conversion or
+LCD output has not caught up, the new display frame is dropped while DVP capture
+continues safely.
 
 ## Stage 3 first capture configuration
 
@@ -206,7 +218,11 @@ components/hm01b0_capture/
 
 components/hm01b0_image/
   include/hm01b0_image.h   Format-aware RAW8 image conversion API
-  hm01b0_image.c           Mono lookup and Bayer bilinear Demosaic to RGB565
+  hm01b0_image.c           Mono lookup and optimized Bayer Demosaic to RGB565
+
+components/hm01b0_live_display/
+  include/                 PSRAM staging pipeline API and statistics
+  hm01b0_live_display.c    Non-blocking staging copy and Image/Display task
 
 components/st7789_display/
   include/                 Handle-based esp_lcd display API and statistics

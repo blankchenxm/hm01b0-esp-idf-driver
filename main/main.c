@@ -14,6 +14,7 @@
 #include "hm01b0.h"
 #include "hm01b0_capture.h"
 #include "hm01b0_image.h"
+#include "hm01b0_live_display.h"
 #include "st7789_display.h"
 
 static const char *TAG = "hm01b0_stage7";
@@ -21,6 +22,7 @@ static const char *TAG = "hm01b0_stage7";
 static hm01b0_handle_t *s_sensor;
 static hm01b0_capture_handle_t *s_capture;
 static st7789_display_handle_t *s_display;
+static hm01b0_live_display_handle_t *s_live_display;
 static uint8_t *s_snapshot;
 static TaskHandle_t s_app_task;
 static hm01b0_snapshot_result_t s_snapshot_result;
@@ -69,10 +71,16 @@ static void hm01b0_live_frame_ready(
     }
     if (!atomic_exchange(&s_live_warmup_complete, true)) {
         st7789_display_reset_stats(display);
+        hm01b0_live_display_reset_stats(s_live_display);
         ESP_LOGI(TAG,
                  "real-image warm-up complete: skipped %u frames before "
                  "display",
                  (unsigned)APP_STREAM_WARMUP_FRAMES);
+    }
+
+    if (s_live_display != NULL) {
+        hm01b0_live_display_consume_frame(frame, s_live_display);
+        return;
     }
 
     uint8_t *rgb565 = NULL;
@@ -155,6 +163,44 @@ static void hm01b0_log_live_display_stats(void)
              stats.last_submit_time_us, stats.max_submit_time_us,
              stats.last_dma_time_us, stats.max_dma_time_us,
              (unsigned)stats.frame_buffer_size);
+
+    if (s_live_display != NULL) {
+        hm01b0_live_display_stats_t pipeline = {0};
+        const esp_err_t pipeline_ret = hm01b0_live_display_get_stats(
+            s_live_display, &pipeline);
+        if (pipeline_ret != ESP_OK) {
+            ESP_LOGE(TAG, "failed to read Image/Display statistics: %s",
+                     esp_err_to_name(pipeline_ret));
+            return;
+        }
+        ESP_LOGI(TAG,
+                 "pipeline_fps input=%" PRIu32 ".%03" PRIu32
+                 " staged=%" PRIu32 ".%03" PRIu32
+                 " submitted=%" PRIu32 ".%03" PRIu32
+                 " frames(input=%" PRIu32 ",staged=%" PRIu32
+                 ",submitted=%" PRIu32 ")",
+                 pipeline.input_fps_milli / 1000U,
+                 pipeline.input_fps_milli % 1000U,
+                 pipeline.staged_fps_milli / 1000U,
+                 pipeline.staged_fps_milli % 1000U,
+                 pipeline.submitted_fps_milli / 1000U,
+                 pipeline.submitted_fps_milli % 1000U,
+                 pipeline.input_frames, pipeline.staged_frames,
+                 pipeline.submitted_frames);
+        ESP_LOGI(TAG,
+                 "pipeline drops staging_busy=%" PRIu32
+                 " rgb_busy=%" PRIu32 " conversion_err=%" PRIu32
+                 " submit_err=%" PRIu32 " staging=%u bytes",
+                 pipeline.staging_busy_drops, pipeline.rgb_busy_drops,
+                 pipeline.conversion_errors, pipeline.submission_errors,
+                 (unsigned)pipeline.staging_buffer_size);
+        ESP_LOGI(TAG,
+                 "pipeline timing: copy(last=%" PRIu32 "us,max=%" PRIu32
+                 "us) demosaic(last=%" PRIu32 "us,max=%" PRIu32 "us)",
+                 pipeline.last_copy_time_us, pipeline.max_copy_time_us,
+                 pipeline.last_conversion_time_us,
+                 pipeline.max_conversion_time_us);
+    }
 }
 
 static void hm01b0_log_preflight_result(
@@ -354,6 +400,8 @@ static void hm01b0_cleanup(void)
     if (s_capture != NULL) {
         (void)hm01b0_capture_set_frame_consumer(s_capture, NULL, NULL);
     }
+    (void)hm01b0_live_display_delete(s_live_display);
+    s_live_display = NULL;
     (void)st7789_display_wait_idle(s_display, 1000U);
     (void)hm01b0_capture_delete(s_capture);
     s_capture = NULL;
@@ -536,6 +584,25 @@ void app_main(void)
                  esp_err_to_name(ret));
         goto fail;
     }
+    if (s_pixel_format != HM01B0_PIXEL_FORMAT_MONO8) {
+        const hm01b0_live_display_config_t pipeline_config = {
+            .display = s_display,
+            .pixel_format = s_pixel_format,
+            .source_width = s_mode_profile.sensor.transport_width,
+            .source_height = s_mode_profile.sensor.transport_height,
+            .source_stride = s_mode_profile.sensor.transport_width,
+            .source_crop = s_mode_profile.display_source,
+            .destination_x = s_mode_profile.display_x,
+            .destination_y = s_mode_profile.display_y,
+        };
+        ret = hm01b0_live_display_new(
+            &pipeline_config, &s_live_display);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "failed to create Bayer Image/Display pipeline: %s",
+                     esp_err_to_name(ret));
+            goto fail;
+        }
+    }
     ret = hm01b0_capture_set_frame_consumer(
         s_capture, hm01b0_live_frame_ready, s_display);
     if (ret != ESP_OK) {
@@ -563,7 +630,7 @@ void app_main(void)
     ESP_LOGI(TAG,
              "Stage 7 running: test pattern OFF, HM01B0 %s %s %ux%u "
              "streaming; source=(%u,%u %ux%u), destination=(%u,%u), "
-             "ST7789=%ux%u RGB565 over esp_lcd SPI DMA",
+             "ST7789=%ux%u RGB565 over esp_lcd SPI DMA, pipeline=%s",
              s_mode_profile.name,
              hm01b0_pixel_format_name(s_pixel_format),
              (unsigned)s_mode_profile.sensor.transport_width,
@@ -575,7 +642,9 @@ void app_main(void)
              (unsigned)s_mode_profile.display_x,
              (unsigned)s_mode_profile.display_y,
              (unsigned)APP_ST7789_WIDTH,
-             (unsigned)APP_ST7789_HEIGHT);
+             (unsigned)APP_ST7789_HEIGHT,
+             s_live_display != NULL ? "PSRAM staging + Image Task"
+                                    : "direct Mono conversion");
 
     while (true) {
         vTaskDelay(pdMS_TO_TICKS(APP_STREAM_STATS_PERIOD_MS));

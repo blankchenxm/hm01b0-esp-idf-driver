@@ -22,7 +22,7 @@ static bool hm01b0_image_is_bayer(hm01b0_pixel_format_t format)
            format <= HM01B0_PIXEL_FORMAT_BAYER_GBRG8;
 }
 
-static hm01b0_cfa_color_t hm01b0_cfa_color(
+static inline hm01b0_cfa_color_t hm01b0_cfa_color(
     hm01b0_pixel_format_t format,
     uint16_t x,
     uint16_t y)
@@ -44,6 +44,65 @@ static hm01b0_cfa_color_t hm01b0_cfa_color(
                      : (odd_x ? HM01B0_CFA_BLUE : HM01B0_CFA_GREEN);
     default:
         return HM01B0_CFA_GREEN;
+    }
+}
+
+static inline uint8_t hm01b0_average_2(uint8_t first, uint8_t second)
+{
+    return (uint8_t)(((uint16_t)first + second + 1U) >> 1U);
+}
+
+static inline uint8_t hm01b0_average_4(uint8_t first,
+                                       uint8_t second,
+                                       uint8_t third,
+                                       uint8_t fourth)
+{
+    return (uint8_t)(((uint16_t)first + second + third + fourth + 2U) >> 2U);
+}
+
+/* Fast path for pixels with a complete one-pixel Bayer neighborhood. */
+static inline void hm01b0_demosaic_interior_pixel(
+    const hm01b0_raw8_image_t *source,
+    uint16_t x,
+    uint16_t y,
+    uint8_t *red,
+    uint8_t *green,
+    uint8_t *blue)
+{
+    const uint8_t *previous = source->data + (size_t)(y - 1U) * source->stride;
+    const uint8_t *current = source->data + (size_t)y * source->stride;
+    const uint8_t *next = source->data + (size_t)(y + 1U) * source->stride;
+    const uint16_t absolute_x = (uint16_t)(source->origin_x + x);
+    const uint16_t absolute_y = (uint16_t)(source->origin_y + y);
+    const hm01b0_cfa_color_t color = hm01b0_cfa_color(
+        source->pixel_format, absolute_x, absolute_y);
+
+    if (color == HM01B0_CFA_RED) {
+        *red = current[x];
+        *green = hm01b0_average_4(current[x - 1U], current[x + 1U],
+                                  previous[x], next[x]);
+        *blue = hm01b0_average_4(previous[x - 1U], previous[x + 1U],
+                                 next[x - 1U], next[x + 1U]);
+        return;
+    }
+    if (color == HM01B0_CFA_BLUE) {
+        *blue = current[x];
+        *green = hm01b0_average_4(current[x - 1U], current[x + 1U],
+                                  previous[x], next[x]);
+        *red = hm01b0_average_4(previous[x - 1U], previous[x + 1U],
+                                next[x - 1U], next[x + 1U]);
+        return;
+    }
+
+    *green = current[x];
+    const hm01b0_cfa_color_t horizontal_color = hm01b0_cfa_color(
+        source->pixel_format, (uint16_t)(absolute_x - 1U), absolute_y);
+    if (horizontal_color == HM01B0_CFA_RED) {
+        *red = hm01b0_average_2(current[x - 1U], current[x + 1U]);
+        *blue = hm01b0_average_2(previous[x], next[x]);
+    } else {
+        *blue = hm01b0_average_2(current[x - 1U], current[x + 1U]);
+        *red = hm01b0_average_2(previous[x], next[x]);
     }
 }
 
@@ -153,6 +212,45 @@ static esp_err_t hm01b0_image_validate(const hm01b0_raw8_image_t *source)
     return ESP_OK;
 }
 
+static void hm01b0_image_convert_row_unchecked(
+    const hm01b0_raw8_image_t *source,
+    uint16_t source_x,
+    uint16_t source_y,
+    uint16_t width,
+    uint8_t *destination)
+{
+    if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
+        hm01b0_init_gray_rgb565();
+    }
+
+    const bool fast_bayer_row =
+        source->pixel_format != HM01B0_PIXEL_FORMAT_MONO8 &&
+        source_y > 0U && source_y + 1U < source->height;
+    for (uint16_t column = 0U; column < width; ++column) {
+        const uint16_t x = (uint16_t)(source_x + column);
+        if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
+            const uint16_t rgb565 = s_gray_rgb565[
+                source->data[(size_t)source_y * source->stride + x]];
+            destination[(size_t)column * 2U] = (uint8_t)(rgb565 >> 8U);
+            destination[(size_t)column * 2U + 1U] = (uint8_t)rgb565;
+            continue;
+        }
+
+        uint8_t red = 0U;
+        uint8_t green = 0U;
+        uint8_t blue = 0U;
+        if (fast_bayer_row && x > 0U && x + 1U < source->width) {
+            hm01b0_demosaic_interior_pixel(source, x, source_y,
+                                            &red, &green, &blue);
+        } else {
+            hm01b0_demosaic_pixel(source, x, source_y,
+                                  &red, &green, &blue);
+        }
+        hm01b0_store_rgb565_be(destination + (size_t)column * 2U,
+                               red, green, blue);
+    }
+}
+
 esp_err_t hm01b0_image_convert_row_to_rgb565_be(
     const hm01b0_raw8_image_t *source,
     uint16_t source_x,
@@ -173,28 +271,8 @@ esp_err_t hm01b0_image_convert_row_to_rgb565_be(
                         ESP_ERR_INVALID_ARG, TAG,
                         "invalid conversion row or destination");
 
-    if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
-        hm01b0_init_gray_rgb565();
-    }
-
-    for (uint16_t column = 0U; column < width; ++column) {
-        const uint16_t x = (uint16_t)(source_x + column);
-        uint8_t red = 0U;
-        uint8_t green = 0U;
-        uint8_t blue = 0U;
-        if (source->pixel_format == HM01B0_PIXEL_FORMAT_MONO8) {
-            const uint16_t rgb565 = s_gray_rgb565[
-                source->data[(size_t)source_y * source->stride + x]];
-            destination[(size_t)column * 2U] = (uint8_t)(rgb565 >> 8U);
-            destination[(size_t)column * 2U + 1U] = (uint8_t)rgb565;
-            continue;
-        } else {
-            hm01b0_demosaic_pixel(source, x, source_y,
-                                  &red, &green, &blue);
-        }
-        hm01b0_store_rgb565_be(destination + (size_t)column * 2U,
-                               red, green, blue);
-    }
+    hm01b0_image_convert_row_unchecked(
+        source, source_x, source_y, width, destination);
     return ESP_OK;
 }
 
@@ -218,12 +296,9 @@ esp_err_t hm01b0_image_convert_to_rgb565_be(
                         "invalid conversion crop or destination");
 
     for (uint16_t row = 0U; row < crop.height; ++row) {
-        ESP_RETURN_ON_ERROR(
-            hm01b0_image_convert_row_to_rgb565_be(
-                source, crop.x, (uint16_t)(crop.y + row), crop.width,
-                destination + (size_t)row * crop.width * 2U,
-                destination_size - (size_t)row * crop.width * 2U),
-            TAG, "failed to convert row %u", (unsigned)row);
+        hm01b0_image_convert_row_unchecked(
+            source, crop.x, (uint16_t)(crop.y + row), crop.width,
+            destination + (size_t)row * crop.width * 2U);
     }
     return ESP_OK;
 }
