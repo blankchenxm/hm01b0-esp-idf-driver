@@ -13,9 +13,10 @@
 #include "freertos/task.h"
 #include "hm01b0.h"
 #include "hm01b0_capture.h"
+#include "hm01b0_image.h"
 #include "st7789_display.h"
 
-static const char *TAG = "hm01b0_stage6";
+static const char *TAG = "hm01b0_stage7";
 
 static hm01b0_handle_t *s_sensor;
 static hm01b0_capture_handle_t *s_capture;
@@ -26,6 +27,7 @@ static hm01b0_snapshot_result_t s_snapshot_result;
 static atomic_bool s_live_warmup_complete;
 static int64_t s_last_display_error_log_us;
 static app_mode_profile_t s_mode_profile;
+static hm01b0_pixel_format_t s_pixel_format;
 
 static void hm01b0_snapshot_ready(
     const hm01b0_snapshot_result_t *result,
@@ -45,6 +47,18 @@ static hm01b0_frame_rect_t hm01b0_to_frame_rect(hm01b0_rect_t rect)
     };
 }
 
+static esp_err_t hm01b0_fill_preflight_row(
+    uint16_t row,
+    uint8_t *destination,
+    size_t destination_size,
+    void *user_data)
+{
+    const hm01b0_raw8_image_t *snapshot = user_data;
+    return hm01b0_image_convert_row_to_rgb565_be(
+        snapshot, 0U, row, snapshot->width,
+        destination, destination_size);
+}
+
 static void hm01b0_live_frame_ready(
     const hm01b0_capture_frame_t *frame,
     void *user_data)
@@ -61,22 +75,49 @@ static void hm01b0_live_frame_ready(
                  (unsigned)APP_STREAM_WARMUP_FRAMES);
     }
 
-    const esp_err_t ret = st7789_display_try_draw_gray8_frame(
+    uint8_t *rgb565 = NULL;
+    size_t rgb565_size = 0U;
+    esp_err_t ret = st7789_display_try_acquire_rgb565_frame(
+        display, &rgb565, &rgb565_size);
+    if (ret == ESP_ERR_TIMEOUT) {
+        return;
+    }
+    if (ret != ESP_OK) {
+        goto display_error;
+    }
+
+    const hm01b0_raw8_image_t source = {
+        .data = frame->data,
+        .width = s_mode_profile.sensor.transport_width,
+        .height = s_mode_profile.sensor.transport_height,
+        .stride = s_mode_profile.sensor.transport_width,
+        .origin_x = 0U,
+        .origin_y = 0U,
+        .pixel_format = s_pixel_format,
+    };
+    const int64_t convert_start_us = esp_timer_get_time();
+    ret = hm01b0_image_convert_to_rgb565_be(
+        &source, s_mode_profile.display_source, rgb565, rgb565_size);
+    const uint32_t convert_time_us = (uint32_t)(
+        esp_timer_get_time() - convert_start_us);
+    if (ret != ESP_OK) {
+        st7789_display_release_rgb565_frame(display);
+        goto display_error;
+    }
+
+    ret = st7789_display_submit_rgb565_frame(
         display,
-        frame->data,
-        s_mode_profile.sensor.transport_width,
-        s_mode_profile.sensor.transport_height,
-        s_mode_profile.sensor.transport_width,
-        s_mode_profile.display_source.x,
-        s_mode_profile.display_source.y,
         s_mode_profile.display_source.width,
         s_mode_profile.display_source.height,
         s_mode_profile.display_x,
-        s_mode_profile.display_y);
+        s_mode_profile.display_y,
+        convert_time_us);
     if (ret == ESP_OK || ret == ESP_ERR_TIMEOUT) {
         return;
     }
 
+display_error:
+    ;
     const int64_t now_us = esp_timer_get_time();
     if (s_last_display_error_log_us == 0 ||
         now_us - s_last_display_error_log_us >= 1000000LL) {
@@ -177,6 +218,7 @@ static esp_err_t hm01b0_run_preflight(
 
     const hm01b0_diagnostic_config_t diagnostic_config = {
         .pattern = diagnostic_pattern,
+        .pixel_format = s_pixel_format,
         .area = analysis_area,
         .warmup_frames = APP_PREFLIGHT_WARMUP_FRAMES,
         .sample_interval_frames = APP_PREFLIGHT_DIAGNOSTIC_INTERVAL,
@@ -234,11 +276,20 @@ static esp_err_t hm01b0_run_preflight(
     }
 
     const int64_t display_start_us = esp_timer_get_time();
-    ret = st7789_display_draw_gray8(
+    const hm01b0_raw8_image_t snapshot_image = {
+        .data = s_snapshot,
+        .width = s_mode_profile.display_source.width,
+        .height = s_mode_profile.display_source.height,
+        .stride = s_mode_profile.display_source.width,
+        .origin_x = s_mode_profile.display_source.x,
+        .origin_y = s_mode_profile.display_source.y,
+        .pixel_format = s_pixel_format,
+    };
+    ret = st7789_display_draw_rgb565_rows(
         s_display, s_mode_profile.display_x, s_mode_profile.display_y,
         s_mode_profile.display_source.width,
         s_mode_profile.display_source.height,
-        s_snapshot);
+        hm01b0_fill_preflight_row, (void *)&snapshot_image);
     if (ret != ESP_OK) {
         (void)hm01b0_stream_stop(s_sensor);
         (void)hm01b0_capture_rx_stop(s_capture);
@@ -316,7 +367,7 @@ static void hm01b0_cleanup(void)
 void app_main(void)
 {
     s_app_task = xTaskGetCurrentTaskHandle();
-    ESP_LOGI(TAG, "Stage 6 startup: initialize, preflight both patterns, "
+    ESP_LOGI(TAG, "Stage 7 startup: initialize, preflight both patterns, "
                   "then stream the selected HM01B0 mode to ST7789");
     ESP_LOGI(TAG, "Control pins: MCLK=%d SDA=%d SCL=%d",
              BOARD_HM01B0_MCLK_GPIO,
@@ -364,6 +415,7 @@ void app_main(void)
         .i2c_scl_gpio = BOARD_HM01B0_I2C_SCL_GPIO,
         .i2c_freq_hz = APP_HM01B0_I2C_FREQUENCY_HZ,
         .enable_internal_i2c_pullups = true,
+        .variant = APP_HM01B0_VARIANT,
         .initial_mode = APP_HM01B0_MODE,
         .data_interface = APP_HM01B0_INTERFACE,
         .frame_rate = APP_HM01B0_FRAME_RATE,
@@ -385,6 +437,10 @@ void app_main(void)
         goto fail;
     }
     ESP_LOGI(TAG, "HM01B0 ready in STANDBY, MODEL_ID=0x%04X", model_id);
+    s_pixel_format = hm01b0_get_pixel_format(s_sensor);
+    ESP_LOGI(TAG, "sensor variant=%s, RAW8 pixel_format=%s",
+             hm01b0_variant_name(hm01b0_get_variant(s_sensor)),
+             hm01b0_pixel_format_name(s_pixel_format));
 
     const st7789_display_config_t display_config = {
         .spi_host = SPI2_HOST,
@@ -401,7 +457,7 @@ void app_main(void)
     if (ret != ESP_OK) {
         goto fail;
     }
-    ret = st7789_display_clear_gray8(s_display, 0U);
+    ret = st7789_display_clear_rgb565(s_display, 0x0000U);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "failed to clear ST7789: %s", esp_err_to_name(ret));
         goto fail;
@@ -505,10 +561,11 @@ void app_main(void)
         goto fail;
     }
     ESP_LOGI(TAG,
-             "Stage 6 running: test pattern OFF, HM01B0 %s RAW8 %ux%u "
+             "Stage 7 running: test pattern OFF, HM01B0 %s %s %ux%u "
              "streaming; source=(%u,%u %ux%u), destination=(%u,%u), "
              "ST7789=%ux%u RGB565 over esp_lcd SPI DMA",
              s_mode_profile.name,
+             hm01b0_pixel_format_name(s_pixel_format),
              (unsigned)s_mode_profile.sensor.transport_width,
              (unsigned)s_mode_profile.sensor.transport_height,
              (unsigned)s_mode_profile.display_source.x,
@@ -529,5 +586,5 @@ void app_main(void)
 
 fail:
     hm01b0_cleanup();
-    ESP_LOGE(TAG, "Stage 6 stopped: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Stage 7 stopped: %s", esp_err_to_name(ret));
 }

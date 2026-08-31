@@ -6,6 +6,7 @@
 #include <stdint.h>
 
 #include "esp_err.h"
+#include "hm01b0_types.h"
 #include "hm01b0_frame_ops.h"
 
 #ifdef __cplusplus
@@ -29,6 +30,7 @@ typedef enum {
 
 typedef struct {
     hm01b0_diagnostic_pattern_t pattern;
+    hm01b0_pixel_format_t pixel_format;
     hm01b0_frame_rect_t area;
     uint32_t warmup_frames;
     /** Analyze the first post-warmup frame, then every N frames. */
@@ -48,6 +50,7 @@ typedef struct {
 } hm01b0_walking_1_result_t;
 
 typedef struct {
+    bool cfa_aware;
     uint32_t sampled_rows;
     uint32_t rows_equal;
     uint32_t rows_compared;
@@ -86,6 +89,7 @@ const char *hm01b0_diagnostic_status_name(
 /** Analyze one complete RAW8 frame without retaining its buffer. */
 esp_err_t hm01b0_diagnostics_analyze_frame(
     hm01b0_diagnostic_pattern_t pattern,
+    hm01b0_pixel_format_t pixel_format,
     const uint8_t *data,
     uint16_t width,
     uint16_t height,

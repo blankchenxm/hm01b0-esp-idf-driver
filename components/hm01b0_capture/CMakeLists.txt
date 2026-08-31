@@ -8,6 +8,7 @@ idf_component_register(
         "include"
     REQUIRES
         esp_driver_cam
+        hm01b0
         esp_driver_gpio
         esp_hw_support
         esp_rom

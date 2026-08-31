@@ -8,6 +8,12 @@
 #define HM01B0_REG_FRAME_COUNT                  0x0005U
 #define HM01B0_REG_PIXEL_ORDER                  0x0006U
 
+#define HM01B0_PIXEL_ORDER_MASK                 0x03U
+#define HM01B0_PIXEL_ORDER_GR                   0x00U
+#define HM01B0_PIXEL_ORDER_RG                   0x01U
+#define HM01B0_PIXEL_ORDER_BG                   0x02U
+#define HM01B0_PIXEL_ORDER_GB                   0x03U
+
 /* Sensor mode control. */
 #define HM01B0_REG_MODE_SELECT                  0x0100U
 #define HM01B0_REG_IMAGE_ORIENTATION            0x0101U
@@ -61,6 +67,10 @@
 #define HM01B0_REG_BLI_ENABLE                   0x1006U
 #define HM01B0_REG_BLC2_TARGET                  0x1007U
 #define HM01B0_REG_DPC_CTRL                     0x1008U
+#define HM01B0_DPC_DISABLED                     0x00U
+#define HM01B0_DPC_MONO_OPTION_1                0x01U
+#define HM01B0_DPC_BAYER_OPTION_1               0x03U
+#define HM01B0_DPC_BAYER_OPTION_2               0x05U
 #define HM01B0_REG_SINGLE_THR_HOT               0x100BU
 #define HM01B0_REG_SINGLE_THR_COLD              0x100CU
 #define HM01B0_REG_SYNC_PIXEL_SHIFT_ENABLE      0x1012U

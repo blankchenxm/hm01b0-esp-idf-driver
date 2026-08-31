@@ -8,6 +8,11 @@
 extern const hm01b0_regval_t hm01b0_common_init[];
 extern const size_t hm01b0_common_init_count;
 
+extern const hm01b0_regval_t hm01b0_variant_mono[];
+extern const size_t hm01b0_variant_mono_count;
+extern const hm01b0_regval_t hm01b0_variant_bayer[];
+extern const size_t hm01b0_variant_bayer_count;
+
 extern const hm01b0_regval_t hm01b0_mode_full[];
 extern const size_t hm01b0_mode_full_count;
 extern const hm01b0_regval_t hm01b0_mode_qvga[];

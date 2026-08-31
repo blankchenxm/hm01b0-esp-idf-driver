@@ -27,6 +27,20 @@ typedef enum {
 } hm01b0_mode_t;
 
 typedef enum {
+    HM01B0_VARIANT_MWA_MONO = 0,
+    HM01B0_VARIANT_ANA_BAYER,
+} hm01b0_variant_t;
+
+/** RAW8 sample interpretation at transport coordinate (0, 0). */
+typedef enum {
+    HM01B0_PIXEL_FORMAT_MONO8 = 0,
+    HM01B0_PIXEL_FORMAT_BAYER_GRBG8,
+    HM01B0_PIXEL_FORMAT_BAYER_RGGB8,
+    HM01B0_PIXEL_FORMAT_BAYER_BGGR8,
+    HM01B0_PIXEL_FORMAT_BAYER_GBRG8,
+} hm01b0_pixel_format_t;
+
+typedef enum {
     HM01B0_DATA_INTERFACE_8_BIT = 0,
     HM01B0_DATA_INTERFACE_4_BIT,
     HM01B0_DATA_INTERFACE_1_BIT,
@@ -80,6 +94,7 @@ typedef struct {
     uint32_t i2c_freq_hz;
     bool enable_internal_i2c_pullups;
 
+    hm01b0_variant_t variant;
     hm01b0_mode_t initial_mode;
     hm01b0_interface_t data_interface;
     hm01b0_frame_rate_t frame_rate;

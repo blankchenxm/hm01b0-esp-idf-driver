@@ -3,10 +3,12 @@
 
 #include "hm01b0.h"
 
-/* Sensor policy for the Stage 6 sample application. */
+/* Sensor policy for the sample application. */
 /* The driver permits 0.5% Sensor_Core tolerance for LEDC quantization. */
 #define APP_HM01B0_MCLK_FREQUENCY_HZ 12000000U
 #define APP_HM01B0_I2C_FREQUENCY_HZ    100000U
+/* MWA supports all modes; ANA is Bayer RAW8 and does not support QQVGA. */
+#define APP_HM01B0_VARIANT HM01B0_VARIANT_ANA_BAYER
 #define APP_HM01B0_MODE HM01B0_SENSOR_MODE_QVGA
 #define APP_HM01B0_INTERFACE HM01B0_DATA_INTERFACE_8_BIT
 /*

@@ -1,17 +1,19 @@
 # hm01b0-esp-idf-driver
 
-ESP-IDF driver under active development for the Himax HM01B0 monochrome image
-sensor on ESP32-S3.
+ESP-IDF driver under active development for Himax HM01B0-MWA monochrome and
+HM01B0-ANA Bayer image sensors on ESP32-S3.
 
 The repository currently contains the completed sensor-control foundation:
 external MCLK generation, 16-bit-address/8-bit-data I2C access, model-ID probe,
 register tables, operating modes, interface configuration, test patterns, and a
 standby/streaming state machine. It also contains direct ESP32-S3 DVP capture
-with two internal DMA frame buffers. Stage 4.5 separates transport, diagnostics,
+with two mode-sized DMA frame buffers. Stage 4.5 separates transport, diagnostics,
 frame operations, and display responsibilities and adds a two-pattern startup
 preflight. Stage 5 adds real-image streaming through the ESP-IDF `esp_lcd`
 ST7789 driver and one complete internal-DMA RGB565 display Buffer. Stage 6
-extends that same pipeline to Full, QVGA, and monochrome QQVGA modes.
+extends that same pipeline to Full, QVGA, and monochrome QQVGA modes. Stage 7
+adds an explicit ANA variant, Bayer phase handling, and direct RAW8 Demosaic to
+RGB565 without allocating an RGB888 frame.
 
 ## Current status
 
@@ -23,7 +25,8 @@ extends that same pipeline to Full, QVGA, and monochrome QQVGA modes.
 | 4. Static ST7789 display | Complete | One post-warm-up 240 x 240 RAW8 crop, task notification, grayscale RGB565 SPI output |
 | 4.5. Pre-streaming architecture | Complete | Component split, on-demand snapshot, tagged diagnostics, Walking-1 then Color-Bar startup preflight |
 | 5. Real-image display | Complete at QVGA 60 FPS | Hardware-validated 80 MHz `esp_lcd` ST7789, RGB565 lookup conversion, one 115,200-byte RGB565 DMA Buffer, continuous QVGA live display |
-| 6. Multi-mode display | Implementation complete; hardware validation pending | One mode-driven Full/QVGA/QQVGA flow, automatic crop/destination geometry, native QQVGA centered with black borders |
+| 6. Multi-mode display | Complete | Hardware-validated Full/QVGA/QQVGA flow, automatic crop/destination geometry, native QQVGA centered with black borders |
+| 7. ANA Bayer support | Implementation in progress | Explicit MWA/ANA variant, PIXEL_ORDER, Bayer DPC, Demosaic-to-RGB565, format-aware preflight/live display |
 
 The current sample initializes the sensor, capture controller, two Camera DMA
 buffers, one shared display workspace, and ST7789. It then runs Walking-1 and
@@ -47,8 +50,9 @@ LCD submission errors.
 
 | Setting | Value |
 |---|---|
-| Sensor mode | QVGA |
-| Pixel output | RAW8 |
+| Sensor variant | Selected in `app_config.h`: MWA Mono or ANA Bayer |
+| Sensor mode | Selected in `app_config.h`: Full/QVGA, plus MWA-only QQVGA |
+| Pixel output | RAW8: MONO8 or Bayer GRBG/RGGB/BGGR/GBRG |
 | Data interface | 8-bit parallel |
 | Initial/final test pattern | Off; Walking-1 and Color-Bar are enabled only during startup preflight |
 | Operation | Non-SYNC |
@@ -56,7 +60,7 @@ LCD submission errors.
 | MCLK | 12 MHz requested external clock; actual LEDC rate is measured at runtime |
 | Sensor_Core | MCLK / 2, with a 0.5% software tolerance for LEDC quantization |
 | Sensor_Register | MCLK / 1 = 12 MHz |
-| Frame timing | 376 PCK x 266 lines, approximately 60 FPS |
+| Frame timing | Calculated from the selected mode and FPS preset |
 | I2C address | `0x24` (7-bit) |
 | Expected model ID | `0x01B0` |
 
@@ -66,6 +70,13 @@ the driver rejects combinations that exceed the current mode or cannot be
 reached with the selected MCLK/interface divider. `hm01b0_set_frame_rate()`
 keeps the mode's datasheet minimum line length, calculates frame length, and
 updates `MAX_INTEGRATION` to `FRAME_LENGTH_LINES - 2` while in standby.
+
+`APP_HM01B0_VARIANT` selects `HM01B0_VARIANT_MWA_MONO` or
+`HM01B0_VARIANT_ANA_BAYER`. Both variants transport one RAW8 byte per pixel;
+ANA does not transport three-byte RGB888 pixels, so Camera Buffer sizes remain
+mode-driven. The common `MODEL_ID=0x01B0` cannot identify the package variant.
+ANA reads `PIXEL_ORDER` to select GRBG/RGGB/BGGR/GBRG interpretation, uses the
+Bayer DPC option, supports Full and QVGA, and rejects hardware QQVGA.
 
 Stage 6 derives every application geometry value from the selected mode:
 
@@ -116,10 +127,11 @@ It returns the Camera DMA buffer before notifying `app_main`, so the one-time
 SPI display transfer cannot hold Buffer A or B.
 
 The validated Stage 5 configuration uses SPI2 at 80 MHz through ESP-IDF
-`esp_lcd` and its asynchronous SPI DMA completion callback. A precomputed
-256-entry lookup table replaces repeated per-pixel RGB565 bit operations.
-`st7789_display_draw_gray8()` converts the packed
-RAW8 preflight snapshot to RGB565 lines and writes the screen once. Camera RX
+`esp_lcd` and its asynchronous SPI DMA completion callback. The independent
+`hm01b0_image` component converts Mono RAW8 through a 256-entry lookup table or
+Bayer RAW8 through bilinear Demosaic directly into RGB565. During preflight,
+the display supplies a single RGB565 row workspace; during live streaming it
+supplies the complete RGB565 DMA workspace. Camera RX
 and optional diagnostics continue during the static hold, without owning either
 Camera Buffer; they are stopped before switching patterns. The detailed Stage 4 scope is
 recorded in [stage4_todo.md](stage4_todo.md), and the architecture decisions are
@@ -192,9 +204,13 @@ components/hm01b0_capture/
   hm01b0_frame_ops.c       Allocation-free RAW8 rectangle copy
   hm01b0_cache_compat.c    ESP-IDF 6.0 internal-SRAM DVP cache workaround
 
+components/hm01b0_image/
+  include/hm01b0_image.h   Format-aware RAW8 image conversion API
+  hm01b0_image.c           Mono lookup and Bayer bilinear Demosaic to RGB565
+
 components/st7789_display/
   include/                 Handle-based esp_lcd display API and statistics
-  st7789_display.c         ST7789 panel, RGB workspace, conversion and SPI DMA
+  st7789_display.c         ST7789 panel, RGB565 workspace ownership and SPI DMA
 
 main/
   board_config.h           Sample board pin mapping

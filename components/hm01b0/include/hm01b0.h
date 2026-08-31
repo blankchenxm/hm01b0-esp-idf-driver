@@ -68,6 +68,15 @@ esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
 esp_err_t hm01b0_get_mode_info(hm01b0_mode_t mode,
                                hm01b0_mode_info_t *info);
 
+/** Return the configured physical sensor variant. */
+hm01b0_variant_t hm01b0_get_variant(const hm01b0_handle_t *dev);
+
+/** Return the RAW8 interpretation derived from variant and PIXEL_ORDER. */
+hm01b0_pixel_format_t hm01b0_get_pixel_format(const hm01b0_handle_t *dev);
+
+const char *hm01b0_variant_name(hm01b0_variant_t variant);
+const char *hm01b0_pixel_format_name(hm01b0_pixel_format_t format);
+
 /** Return the driver's current state without accessing the sensor bus. */
 hm01b0_state_t hm01b0_get_state(const hm01b0_handle_t *dev);
 

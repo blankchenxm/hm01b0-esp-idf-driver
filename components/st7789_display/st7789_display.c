@@ -22,7 +22,6 @@
 #define ST7789_GMCTRN1  0xE1U
 
 #define ST7789_RGB565_BYTES_PER_PIXEL 2U
-#define ST7789_GRAY8_LUT_SIZE         256U
 #define ST7789_SPI_QUEUE_DEPTH        1U
 
 struct st7789_display {
@@ -36,7 +35,6 @@ struct st7789_display {
     size_t preflight_line_size;
     uint8_t *rgb_frame;
     size_t rgb_frame_size;
-    uint16_t rgb565_table[ST7789_GRAY8_LUT_SIZE];
     bool bus_initialized;
     bool stream_prepared;
     bool transfer_completes_frame;
@@ -141,35 +139,6 @@ static esp_err_t st7789_send_tuning(st7789_display_handle_t *display)
     return ESP_OK;
 }
 
-static void st7789_init_rgb565_table(st7789_display_handle_t *display)
-{
-    for (uint16_t gray = 0U; gray < ST7789_GRAY8_LUT_SIZE; ++gray) {
-        const uint16_t rgb565 =
-            (uint16_t)(((gray >> 3U) << 11U) |
-                       ((gray >> 2U) << 5U) |
-                       (gray >> 3U));
-
-        /*
-         * ESP32-S3 stores uint16_t little-endian, while the validated panel
-         * byte stream is RGB565 MSB first. Store the byte-swapped word once
-         * so the hot conversion loop needs only a lookup and a 16-bit store.
-         */
-        display->rgb565_table[gray] =
-            (uint16_t)((rgb565 >> 8U) | (rgb565 << 8U));
-    }
-}
-
-static void st7789_gray8_to_rgb565_be(const uint16_t *rgb565_table,
-                                      const uint8_t *source,
-                                      uint8_t *destination,
-                                      size_t pixel_count)
-{
-    uint16_t *destination_pixels = (uint16_t *)destination;
-    for (size_t i = 0; i < pixel_count; ++i) {
-        destination_pixels[i] = rgb565_table[source[i]];
-    }
-}
-
 static esp_err_t st7789_take_buffer(st7789_display_handle_t *display,
                                     TickType_t wait_ticks)
 {
@@ -242,7 +211,6 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
                         "failed to allocate display context");
     display->config = *config;
     display->stats_lock = (portMUX_TYPE)portMUX_INITIALIZER_UNLOCKED;
-    st7789_init_rgb565_table(display);
     display->rgb_frame_size = (size_t)config->width * config->height *
                               ST7789_RGB565_BYTES_PER_PIXEL;
     display->preflight_line_size =
@@ -343,10 +311,9 @@ esp_err_t st7789_display_new(const st7789_display_config_t *config,
     st7789_display_reset_stats(display);
     ESP_LOGI(TAG,
              "ST7789 initialized with esp_lcd (%ux%u RGB565, SPI=%" PRIu32
-             " Hz, max_transfer=%u, gray_lut=%u bytes)",
+             " Hz, max_transfer=%u)",
              config->width, config->height, config->clock_speed_hz,
-             (unsigned)display->rgb_frame_size,
-             (unsigned)sizeof(display->rgb565_table));
+             (unsigned)display->rgb_frame_size);
     *out_display = display;
     return ESP_OK;
 
@@ -386,14 +353,16 @@ esp_err_t st7789_display_delete(st7789_display_handle_t *display)
     return result;
 }
 
-esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
-                                    uint16_t x,
-                                    uint16_t y,
-                                    uint16_t width,
-                                    uint16_t height,
-                                    const uint8_t *data)
+esp_err_t st7789_display_draw_rgb565_rows(
+    st7789_display_handle_t *display,
+    uint16_t x,
+    uint16_t y,
+    uint16_t width,
+    uint16_t height,
+    st7789_rgb565_row_fill_cb_t fill_row,
+    void *user_data)
 {
-    ESP_RETURN_ON_FALSE(display != NULL && data != NULL,
+    ESP_RETURN_ON_FALSE(display != NULL && fill_row != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
     ESP_RETURN_ON_FALSE(display->preflight_line != NULL,
                         ESP_ERR_INVALID_STATE, TAG,
@@ -413,10 +382,13 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
     for (uint16_t row = 0; row < height; ++row) {
         ESP_RETURN_ON_ERROR(st7789_take_buffer(display, portMAX_DELAY), TAG,
                             "failed to acquire preflight line buffer");
-        st7789_gray8_to_rgb565_be(
-            display->rgb565_table,
-            data + (size_t)row * width,
-            display->preflight_line, width);
+        const esp_err_t fill_ret = fill_row(
+            row, display->preflight_line, display->preflight_line_size,
+            user_data);
+        if (fill_ret != ESP_OK) {
+            st7789_release_buffer(display);
+            return fill_ret;
+        }
         const esp_err_t ret = st7789_submit(
             display, x, (uint16_t)(y + row), width, 1U,
             display->preflight_line, row == height - 1U);
@@ -427,8 +399,8 @@ esp_err_t st7789_display_draw_gray8(st7789_display_handle_t *display,
     return st7789_display_wait_idle(display, 1000U);
 }
 
-esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
-                                     uint8_t gray)
+esp_err_t st7789_display_clear_rgb565(st7789_display_handle_t *display,
+                                     uint16_t rgb565)
 {
     ESP_RETURN_ON_FALSE(display != NULL, ESP_ERR_INVALID_ARG, TAG,
                         "display handle is NULL");
@@ -436,10 +408,9 @@ esp_err_t st7789_display_clear_gray8(st7789_display_handle_t *display,
                         ESP_ERR_INVALID_STATE, TAG,
                         "preflight line buffer has been released");
 
-    uint16_t *pixels = (uint16_t *)display->preflight_line;
-    const uint16_t color = display->rgb565_table[gray];
     for (uint16_t x = 0U; x < display->config.width; ++x) {
-        pixels[x] = color;
+        display->preflight_line[(size_t)x * 2U] = (uint8_t)(rgb565 >> 8U);
+        display->preflight_line[(size_t)x * 2U + 1U] = (uint8_t)rgb565;
     }
 
     for (uint16_t row = 0U; row < display->config.height; ++row) {
@@ -495,63 +466,60 @@ esp_err_t st7789_display_prepare_stream(st7789_display_handle_t *display)
     return ESP_OK;
 }
 
-esp_err_t st7789_display_try_draw_gray8_frame(
+esp_err_t st7789_display_try_acquire_rgb565_frame(
     st7789_display_handle_t *display,
-    const uint8_t *source,
-    uint16_t source_width,
-    uint16_t source_height,
-    size_t source_stride,
-    uint16_t source_x,
-    uint16_t source_y,
-    uint16_t width,
-    uint16_t height,
-    uint16_t destination_x,
-    uint16_t destination_y)
+    uint8_t **buffer,
+    size_t *buffer_size)
 {
-    ESP_RETURN_ON_FALSE(display != NULL && source != NULL,
+    ESP_RETURN_ON_FALSE(display != NULL && buffer != NULL &&
+                            buffer_size != NULL,
                         ESP_ERR_INVALID_ARG, TAG, "invalid argument");
     ESP_RETURN_ON_FALSE(display->stream_prepared &&
                             display->rgb_frame != NULL,
                         ESP_ERR_INVALID_STATE, TAG,
                         "stream buffer is not prepared");
-    ESP_RETURN_ON_FALSE(
-        source_width > 0U && source_height > 0U &&
-            source_stride >= source_width && width > 0U && height > 0U &&
-            source_x < source_width && source_y < source_height &&
-            width <= source_width - source_x &&
-            height <= source_height - source_y &&
-            destination_x < display->config.width &&
-            destination_y < display->config.height &&
-            width <= display->config.width - destination_x &&
-            height <= display->config.height - destination_y,
-        ESP_ERR_INVALID_ARG, TAG, "invalid source/destination rectangle");
-
     if (st7789_take_buffer(display, 0U) != ESP_OK) {
         portENTER_CRITICAL(&display->stats_lock);
         display->stats.dropped_busy++;
         portEXIT_CRITICAL(&display->stats_lock);
         return ESP_ERR_TIMEOUT;
     }
+    *buffer = display->rgb_frame;
+    *buffer_size = display->rgb_frame_size;
+    return ESP_OK;
+}
 
-    const int64_t convert_start_us = esp_timer_get_time();
-    for (uint16_t row = 0; row < height; ++row) {
-        const uint8_t *source_row =
-            source + (size_t)(source_y + row) * source_stride + source_x;
-        uint8_t *destination_row =
-            display->rgb_frame +
-            (size_t)row * width *
-                ST7789_RGB565_BYTES_PER_PIXEL;
-        st7789_gray8_to_rgb565_be(
-            display->rgb565_table,
-            source_row, destination_row, width);
+void st7789_display_release_rgb565_frame(st7789_display_handle_t *display)
+{
+    if (display != NULL) {
+        st7789_release_buffer(display);
     }
-    const uint32_t convert_time_us = (uint32_t)(
-        esp_timer_get_time() - convert_start_us);
+}
+
+esp_err_t st7789_display_submit_rgb565_frame(
+    st7789_display_handle_t *display,
+    uint16_t width,
+    uint16_t height,
+    uint16_t destination_x,
+    uint16_t destination_y,
+    uint32_t conversion_time_us)
+{
+    ESP_RETURN_ON_FALSE(display != NULL && display->stream_prepared &&
+                            width > 0U && height > 0U &&
+                            destination_x < display->config.width &&
+                            destination_y < display->config.height &&
+                            width <= display->config.width - destination_x &&
+                            height <= display->config.height - destination_y &&
+                            (size_t)width * height *
+                                    ST7789_RGB565_BYTES_PER_PIXEL <=
+                                display->rgb_frame_size,
+                        ESP_ERR_INVALID_ARG, TAG,
+                        "invalid RGB565 submission rectangle");
 
     portENTER_CRITICAL(&display->stats_lock);
-    display->stats.last_convert_time_us = convert_time_us;
-    if (convert_time_us > display->stats.max_convert_time_us) {
-        display->stats.max_convert_time_us = convert_time_us;
+    display->stats.last_convert_time_us = conversion_time_us;
+    if (conversion_time_us > display->stats.max_convert_time_us) {
+        display->stats.max_convert_time_us = conversion_time_us;
     }
     portEXIT_CRITICAL(&display->stats_lock);
 

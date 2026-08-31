@@ -368,9 +368,11 @@ static void hm01b0_capture_log_diagnostic(
     } else if (report->pattern == HM01B0_DIAGNOSTIC_PATTERN_COLOR_BAR) {
         const hm01b0_color_bar_result_t *result = &report->result.color_bar;
         ESP_LOGI(TAG,
-                 "Color-Bar rows=%" PRIu32 " equal=%" PRIu32 "/%" PRIu32
+                 "Color-Bar cfa_aware=%u rows=%" PRIu32
+                 " equal=%" PRIu32 "/%" PRIu32
                  " transitions=%" PRIu32 " strong=%" PRIu32
                  " unique=%" PRIu32 " range=%02X..%02X",
+                 result->cfa_aware ? 1U : 0U,
                  result->sampled_rows, result->rows_equal,
                  result->rows_compared, result->horizontal_transitions,
                  result->strong_transitions, result->unique_values,
@@ -542,6 +544,7 @@ static void hm01b0_capture_process_diagnostics(
 
     if (hm01b0_diagnostics_analyze_frame(
             handle->diagnostic_config.pattern,
+            handle->diagnostic_config.pixel_format,
             frame->data,
             handle->config.frame_width,
             handle->config.frame_height,
@@ -949,11 +952,17 @@ esp_err_t hm01b0_capture_set_diagnostics(
     ESP_RETURN_ON_FALSE(config->sample_interval_frames > 0U,
                         ESP_ERR_INVALID_ARG, TAG,
                         "diagnostic sample interval must be greater than 0");
+    ESP_RETURN_ON_FALSE(
+        config->pixel_format >= HM01B0_PIXEL_FORMAT_MONO8 &&
+            config->pixel_format <= HM01B0_PIXEL_FORMAT_BAYER_GBRG8,
+        ESP_ERR_INVALID_ARG, TAG, "invalid diagnostic pixel format");
     handle->diagnostic_config = *config;
     handle->diagnostic_enabled = true;
-    ESP_LOGI(TAG, "diagnostics configured: pattern=%s area=(%u,%u %ux%u) "
-                  "warmup=%" PRIu32 " sample_interval=%" PRIu32,
+    ESP_LOGI(TAG, "diagnostics configured: pattern=%s format=%s "
+                  "area=(%u,%u %ux%u) warmup=%" PRIu32
+                  " sample_interval=%" PRIu32,
              hm01b0_diagnostic_pattern_name(config->pattern),
+             hm01b0_pixel_format_name(config->pixel_format),
              (unsigned)config->area.x, (unsigned)config->area.y,
              (unsigned)config->area.width, (unsigned)config->area.height,
              config->warmup_frames, config->sample_interval_frames);

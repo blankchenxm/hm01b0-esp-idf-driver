@@ -18,6 +18,57 @@
 
 static const char *TAG = "hm01b0_sensor";
 
+const char *hm01b0_variant_name(hm01b0_variant_t variant)
+{
+    switch (variant) {
+    case HM01B0_VARIANT_MWA_MONO:
+        return "MWA_MONO";
+    case HM01B0_VARIANT_ANA_BAYER:
+        return "ANA_BAYER";
+    default:
+        return "INVALID";
+    }
+}
+
+const char *hm01b0_pixel_format_name(hm01b0_pixel_format_t format)
+{
+    switch (format) {
+    case HM01B0_PIXEL_FORMAT_MONO8:
+        return "MONO8";
+    case HM01B0_PIXEL_FORMAT_BAYER_GRBG8:
+        return "GRBG8";
+    case HM01B0_PIXEL_FORMAT_BAYER_RGGB8:
+        return "RGGB8";
+    case HM01B0_PIXEL_FORMAT_BAYER_BGGR8:
+        return "BGGR8";
+    case HM01B0_PIXEL_FORMAT_BAYER_GBRG8:
+        return "GBRG8";
+    default:
+        return "INVALID";
+    }
+}
+
+static hm01b0_pixel_format_t hm01b0_decode_pixel_format(
+    hm01b0_variant_t variant,
+    uint8_t pixel_order)
+{
+    if (variant == HM01B0_VARIANT_MWA_MONO) {
+        return HM01B0_PIXEL_FORMAT_MONO8;
+    }
+    switch (pixel_order & HM01B0_PIXEL_ORDER_MASK) {
+    case HM01B0_PIXEL_ORDER_GR:
+        return HM01B0_PIXEL_FORMAT_BAYER_GRBG8;
+    case HM01B0_PIXEL_ORDER_RG:
+        return HM01B0_PIXEL_FORMAT_BAYER_RGGB8;
+    case HM01B0_PIXEL_ORDER_BG:
+        return HM01B0_PIXEL_FORMAT_BAYER_BGGR8;
+    case HM01B0_PIXEL_ORDER_GB:
+        return HM01B0_PIXEL_FORMAT_BAYER_GBRG8;
+    default:
+        return HM01B0_PIXEL_FORMAT_BAYER_BGGR8;
+    }
+}
+
 typedef struct {
     uint16_t min_line_length_pck;
     uint16_t min_frame_length_lines;
@@ -95,6 +146,11 @@ esp_err_t hm01b0_probe(hm01b0_handle_t *dev, uint16_t *model_id)
     ESP_RETURN_ON_ERROR(hm01b0_reg_read(dev, HM01B0_REG_MODEL_ID_L,
                                         &id_low),
                         TAG, "failed to read MODEL_ID_L");
+    ESP_RETURN_ON_ERROR(hm01b0_reg_read(dev, HM01B0_REG_PIXEL_ORDER,
+                                        &dev->pixel_order),
+                        TAG, "failed to read PIXEL_ORDER");
+    dev->pixel_format = hm01b0_decode_pixel_format(
+        dev->variant, dev->pixel_order);
 
     const uint16_t detected_id = ((uint16_t)id_high << 8) | id_low;
     if (model_id != NULL) {
@@ -108,6 +164,10 @@ esp_err_t hm01b0_probe(hm01b0_handle_t *dev, uint16_t *model_id)
                  HM01B0_EXPECTED_MODEL_ID);
         return ESP_ERR_NOT_FOUND;
     }
+
+    ESP_LOGI(TAG, "variant=%s, PIXEL_ORDER=0x%02X, pixel_format=%s",
+             hm01b0_variant_name(dev->variant), dev->pixel_order,
+             hm01b0_pixel_format_name(dev->pixel_format));
 
     return ESP_OK;
 }
@@ -174,6 +234,12 @@ esp_err_t hm01b0_set_mode(hm01b0_handle_t *dev, hm01b0_mode_t mode)
 {
     ESP_RETURN_ON_ERROR(hm01b0_require_standby(dev), TAG,
                         "cannot configure sensor mode");
+
+    ESP_RETURN_ON_FALSE(
+        dev->variant != HM01B0_VARIANT_ANA_BAYER ||
+            mode != HM01B0_SENSOR_MODE_QQVGA,
+        ESP_ERR_NOT_SUPPORTED, TAG,
+        "ANA Bayer variant does not support QQVGA binning");
 
     const hm01b0_regval_t *table = NULL;
     size_t count = 0;
@@ -489,4 +555,14 @@ esp_err_t hm01b0_set_test_pattern(hm01b0_handle_t *dev,
 hm01b0_state_t hm01b0_get_state(const hm01b0_handle_t *dev)
 {
     return dev == NULL ? HM01B0_STATE_UNINITIALIZED : dev->state;
+}
+
+hm01b0_variant_t hm01b0_get_variant(const hm01b0_handle_t *dev)
+{
+    return dev == NULL ? HM01B0_VARIANT_MWA_MONO : dev->variant;
+}
+
+hm01b0_pixel_format_t hm01b0_get_pixel_format(const hm01b0_handle_t *dev)
+{
+    return dev == NULL ? HM01B0_PIXEL_FORMAT_MONO8 : dev->pixel_format;
 }

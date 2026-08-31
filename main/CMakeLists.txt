@@ -6,6 +6,7 @@ idf_component_register(
     REQUIRES
         hm01b0
         hm01b0_capture
+        hm01b0_image
         st7789_display
         esp_timer
 )
